@@ -52,10 +52,11 @@ def show_comparison(title, image, mask, overlay=True, scale=1.0, max_size=(1200,
     else:
         mask_gray = mask
 
-    # Normalizacja maski do 0..255 dtype=uint8
-    mask_gray = cv2.normalize(mask_gray, None, 0, 255, cv2.NORM_MINMAX)
     if mask_gray.dtype != np.uint8:
-        mask_gray = mask_gray.astype(np.uint8)
+        m = mask_gray.astype(np.float32)
+        if m.max() <= 1.0:
+            m = m * 255.0
+        mask_gray = np.clip(m, 0, 255).astype(np.uint8)
 
     # Koloryzacja maski (czerwony kanał)
     mask_bgr = cv2.cvtColor(mask_gray, cv2.COLOR_GRAY2BGR)
@@ -126,9 +127,11 @@ def build_comparison(image, mask, overlay=True):
     else:
         mask_gray = mask
 
-    mask_gray = cv2.normalize(mask_gray, None, 0, 255, cv2.NORM_MINMAX)
     if mask_gray.dtype != np.uint8:
-        mask_gray = mask_gray.astype(np.uint8)
+        m = mask_gray.astype(np.float32)
+        if m.max() <= 1.0:
+            m = m * 255.0
+        mask_gray = np.clip(m, 0, 255).astype(np.uint8)
 
     mask_bgr = cv2.cvtColor(mask_gray, cv2.COLOR_GRAY2BGR)
     colored_mask = np.zeros_like(mask_bgr)
@@ -206,3 +209,361 @@ def draw_light_vector(img_bgr, angle_deg, vec_xy=None, origin=None, length=None,
 
     draw_text_box(out, f"Light dir: {angle_deg:.1f} deg", org=(ox, max(25, oy - 10)), font_scale=0.55, color=(255, 255, 255), bg_color=(0, 0, 0))
     return out
+
+
+def _as_gray_mask(mask, target_shape_hw=None):
+    if mask is None:
+        return None
+    if len(mask.shape) == 3:
+        m = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    else:
+        m = mask
+    if target_shape_hw is not None and m.shape[:2] != tuple(target_shape_hw):
+        m = cv2.resize(m, (int(target_shape_hw[1]), int(target_shape_hw[0])), interpolation=cv2.INTER_NEAREST)
+    if m.dtype != np.uint8:
+        # najczęstszy przypadek: maska 0/1 lub bool
+        m = (m.astype(np.float32))
+        if m.max() <= 1.0:
+            m = (m * 255.0)
+        m = np.clip(m, 0, 255).astype(np.uint8)
+    return m
+
+
+def draw_pca_axis_and_tip(img_bgr, centroid_xy, axis_vec_xy, tip_xy=None, color=(255, 200, 0)):
+    """Rysuje oś PCA przechodzącą przez centroid + opcjonalny tip."""
+    if img_bgr is None or centroid_xy is None or axis_vec_xy is None:
+        return img_bgr
+
+    out = img_bgr
+    h, w = out.shape[:2]
+
+    cx, cy = float(centroid_xy[0]), float(centroid_xy[1])
+    vx, vy = float(axis_vec_xy[0]), float(axis_vec_xy[1])
+    n = (vx * vx + vy * vy) ** 0.5 + 1e-6
+    vx /= n
+    vy /= n
+
+    L = 0.45 * min(h, w)
+    p1 = (int(round(cx - vx * L)), int(round(cy - vy * L)))
+    p2 = (int(round(cx + vx * L)), int(round(cy + vy * L)))
+
+    cv2.line(out, p1, p2, color, 2, cv2.LINE_AA)
+    cv2.circle(out, (int(round(cx)), int(round(cy))), 4, (255, 255, 255), -1)
+
+    if tip_xy is not None:
+        tx, ty = int(round(float(tip_xy[0]))), int(round(float(tip_xy[1])))
+        cv2.circle(out, (tx, ty), 5, (0, 255, 255), -1)
+        cv2.line(out, (int(round(cx)), int(round(cy))), (tx, ty), (0, 255, 255), 2, cv2.LINE_AA)
+
+    return out
+
+
+def draw_hough_lines(img_bgr, lines, color=(0, 200, 255)):
+    """Rysuje wynik HoughLinesP (Nx1x4) na obrazie."""
+    if img_bgr is None or lines is None:
+        return img_bgr
+    out = img_bgr
+    try:
+        for l in lines[:, 0, :]:
+            x1, y1, x2, y2 = [int(v) for v in l]
+            cv2.line(out, (x1, y1), (x2, y2), color, 1, cv2.LINE_AA)
+    except Exception:
+        pass
+    return out
+
+
+def overlay_mask_red(img_bgr, mask, alpha=0.35):
+    """Nakłada maskę jako czerwony overlay."""
+    if img_bgr is None or mask is None:
+        return img_bgr
+    m = _as_gray_mask(mask, target_shape_hw=img_bgr.shape[:2])
+    if m is None:
+        return img_bgr
+    colored = np.zeros_like(img_bgr)
+    colored[:, :, 2] = m
+    return cv2.addWeighted(img_bgr, 1.0 - float(alpha), colored, float(alpha), 0)
+
+
+def draw_vector_arrow(img_bgr, vec_xy, origin=None, length=None, color=(0, 255, 0), thickness=2):
+    """Rysuje strzałkę wektora 2D."""
+    if img_bgr is None or vec_xy is None:
+        return img_bgr
+    out = img_bgr
+    h, w = out.shape[:2]
+
+    if origin is None:
+        origin = (int(0.12 * w), int(0.18 * h))
+    ox, oy = int(origin[0]), int(origin[1])
+
+    if length is None:
+        length = int(0.18 * min(h, w))
+
+    vx, vy = float(vec_xy[0]), float(vec_xy[1])
+    n = (vx * vx + vy * vy) ** 0.5 + 1e-6
+    vx /= n
+    vy /= n
+
+    ex = int(round(ox + vx * length))
+    ey = int(round(oy + vy * length))
+
+    cv2.arrowedLine(out, (ox, oy), (ex, ey), color, int(thickness), tipLength=0.25)
+    cv2.circle(out, (ox, oy), 4, color, -1)
+    return out
+
+
+def draw_confidence_badge(img_bgr, confidence, text=None, org=(10, 30)):
+    """Mały 'badge' z confidence w rogu."""
+    if img_bgr is None:
+        return img_bgr
+    conf = float(confidence) if confidence is not None else 0.0
+    conf = float(np.clip(conf, 0.0, 1.0))
+
+    if text is None:
+        text = f"conf={conf:.2f}"
+
+    # kolor od czerwonego do zielonego
+    r = int(round(255 * (1.0 - conf)))
+    g = int(round(255 * conf))
+    col = (0, g, r)
+
+    x, y = int(org[0]), int(org[1])
+    pad = 6
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.65
+    (tw, th), bl = cv2.getTextSize(text, font, fs, 2)
+    cv2.rectangle(img_bgr, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), (0, 0, 0), -1)
+    cv2.rectangle(img_bgr, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), col, 2)
+    cv2.putText(img_bgr, text, (x, y), font, fs, (255, 255, 255), 2, cv2.LINE_AA)
+    return img_bgr
+
+
+def build_light_direction_debug_view(image_bgr, shadow_mask, fuse_dbg, overlay_alpha=0.35):
+    """Buduje pojedynczy obraz podglądowy z nałożeniami (do oceny ręcznej).
+
+    fuse_dbg: wynik debug z fuse_light_vectors(..., debug=True)
+    """
+    if image_bgr is None:
+        return None
+
+    out = image_bgr.copy()
+    if shadow_mask is not None:
+        out = overlay_mask_red(out, shadow_mask, alpha=overlay_alpha)
+
+    # PCA axis + tip
+    try:
+        m = (fuse_dbg or {}).get('mask')
+        if m and m.get('dbg'):
+            dbg_m = m['dbg']
+            out = draw_pca_axis_and_tip(out, dbg_m.get('centroid_xy'), dbg_m.get('axis_vec'), dbg_m.get('tip_xy'))
+    except Exception:
+        pass
+
+    # final vector + confidence
+    try:
+        v_final = (fuse_dbg or {}).get('v_final')
+        conf_final = (fuse_dbg or {}).get('conf_final', 0.0)
+        if v_final is not None:
+            out = draw_vector_arrow(out, v_final, color=(0, 255, 0))
+        draw_confidence_badge(out, conf_final, text=f"final conf={float(conf_final):.2f}", org=(10, 30))
+    except Exception:
+        pass
+
+    # annotate components confidence
+    try:
+        h = (fuse_dbg or {}).get('hough', {})
+        mh = float(h.get('conf', 0.0))
+        m = (fuse_dbg or {}).get('mask')
+        mm = float(m.get('conf', 0.0)) if m else 0.0
+        txt = f"Hough={mh:.2f}  Mask={mm:.2f}"
+        cv2.putText(out, txt, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, txt, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    except Exception:
+        pass
+
+    return out
+
+
+def letterbox_to_canvas(img_bgr, canvas_w, canvas_h, bg=(10, 10, 10), inner_margin=12, draw_frame=True):
+    """Skaluje obraz do stałej ramki (canvas) z zachowaniem proporcji i paddingiem."""
+    if img_bgr is None:
+        return None
+    ch, cw = img_bgr.shape[:2]
+    if ch <= 0 or cw <= 0:
+        return None
+
+    canvas_w = int(canvas_w)
+    canvas_h = int(canvas_h)
+    inner_margin = int(max(0, inner_margin))
+
+    avail_w = max(1, canvas_w - 2 * inner_margin)
+    avail_h = max(1, canvas_h - 2 * inner_margin)
+
+    s = min(float(avail_w) / float(cw), float(avail_h) / float(ch))
+    s = max(1e-6, s)
+    nw = max(1, int(round(cw * s)))
+    nh = max(1, int(round(ch * s)))
+
+    interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(img_bgr, (nw, nh), interpolation=interp)
+
+    canvas = np.full((canvas_h, canvas_w, 3), bg, dtype=np.uint8)
+    x0 = (canvas_w - nw) // 2
+    y0 = (canvas_h - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+
+    if draw_frame:
+        cv2.rectangle(canvas, (0, 0), (canvas_w - 1, canvas_h - 1), (60, 60, 60), 1)
+        cv2.rectangle(canvas, (x0, y0), (x0 + nw - 1, y0 + nh - 1), (90, 90, 90), 1)
+
+    return canvas
+
+
+def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, w=170, h=300, title='LIGHT'):
+    """Mały 'kompas' pokazujący kierunek światła strzałką."""
+    w = int(max(96, w))
+    h = int(max(96, h))
+    canvas = np.full((h, w, 3), (14, 14, 14), dtype=np.uint8)
+
+    cx, cy = w // 2, h // 2
+    r = int(0.38 * min(w, h))
+
+    if title:
+        cv2.putText(canvas, str(title), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
+
+    cv2.circle(canvas, (cx, cy), r, (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), 2, (200, 200, 200), -1)
+
+    def put(lbl, px, py):
+        cv2.putText(canvas, lbl, (px, py), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+    put('N', cx - 6, cy - r - 10)
+    put('S', cx - 6, cy + r + 18)
+    put('W', cx - r - 22, cy + 6)
+    put('E', cx + r + 10, cy + 6)
+
+    if vec_xy is not None:
+        vx, vy = float(vec_xy[0]), float(vec_xy[1])
+        n = (vx * vx + vy * vy) ** 0.5 + 1e-6
+        vx /= n
+        vy /= n
+        ex = int(round(cx + vx * (r - 6)))
+        ey = int(round(cy + vy * (r - 6)))
+        cv2.arrowedLine(canvas, (cx, cy), (ex, ey), (0, 255, 0), 2, tipLength=0.22)
+
+    conf = float(np.clip(float(confidence), 0.0, 1.0))
+    ang = float(angle_deg) % 360.0
+    cv2.putText(canvas, f"ang {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"conf {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+
+    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (60, 60, 60), 1)
+    return canvas
+
+
+def render_status_panel(width, panel_h, params_text_lines, help_line=None, bg=(18, 18, 18)):
+    """Uniwersalny panel statusu pod obrazem.
+
+    params_text_lines: lista maks 3 linijek.
+    """
+    panel = np.full((int(panel_h), int(width), 3), bg, dtype=np.uint8)
+    y = 24
+    for i, line in enumerate(params_text_lines[:3]):
+        cv2.putText(panel, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
+        y += 27
+    if help_line:
+        cv2.putText(panel, help_line, (12, int(panel_h) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 180, 180), 1, cv2.LINE_AA)
+    return panel
+
+
+class ToggleButtons:
+    """Prosty panel klikalnych przycisków ON/OFF (bez suwaków).
+
+    Użycie:
+      buttons = ToggleButtons([('GEOM','use_geometry'), ('CLAHE','use_clahe')])
+      buttons.draw(frame)
+      if buttons.handle_click(x,y): ...
+    """
+
+    def __init__(self, items, origin=(10, 10), button_size=(120, 34), gap=10):
+        self.items = [(label, key) for (label, key) in items]
+        self.origin = (int(origin[0]), int(origin[1]))
+        self.button_size = (int(button_size[0]), int(button_size[1]))
+        self.gap = int(gap)
+
+    def layout(self):
+        x0, y0 = self.origin
+        bw, bh = self.button_size
+        rects = {}
+        x = x0
+        for label, key in self.items:
+            rects[key] = (x, y0, x + bw, y0 + bh, label)
+            x += bw + self.gap
+        return rects
+
+    def draw(self, img_bgr, state: dict):
+        rects = self.layout()
+        for key, (x1, y1, x2, y2, label) in rects.items():
+            on = bool(state.get(key, False))
+            fill = (40, 120, 40) if on else (60, 60, 60)
+            border = (90, 220, 90) if on else (140, 140, 140)
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), fill, -1)
+            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), border, 2)
+            txt = f"{label}: {'ON' if on else 'OFF'}"
+            cv2.putText(img_bgr, txt, (x1 + 8, y1 + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 245, 245), 1, cv2.LINE_AA)
+        return img_bgr
+
+    def handle_click(self, x, y, state: dict):
+        rects = self.layout()
+        for key, (x1, y1, x2, y2, _label) in rects.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                state[key] = not bool(state.get(key, False))
+                return key
+        return None
+
+
+def build_main_view(image_bgr,
+                    shadow_mask,
+                    overlay,
+                    show_direction,
+                    light_vec,
+                    light_ang,
+                    light_conf,
+                    view_w,
+                    view_h,
+                    compass_w,
+                    panel_h,
+                    params_lines,
+                    help_line,
+                    buttons: ToggleButtons | None = None,
+                    button_state: dict | None = None):
+    """Składa główny widok: porównanie + kompas + (opcjonalnie) panel statusu.
+
+    Zwraca: view_bgr
+    """
+    comp = build_comparison(image_bgr, shadow_mask, overlay=overlay)
+    if comp is None:
+        return None
+
+    comp_fixed = letterbox_to_canvas(comp, view_w, view_h)
+    if comp_fixed is None:
+        return None
+
+    compass = render_compass_widget(light_vec if show_direction else None,
+                                   angle_deg=light_ang if show_direction else 0.0,
+                                   confidence=light_conf if show_direction else 0.0,
+                                   w=compass_w,
+                                   h=view_h)
+    if not show_direction:
+        cv2.putText(compass, 'DIR OFF', (20, view_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+
+    top_row = cv2.hconcat([comp_fixed, compass])
+
+    # przyciski rysujemy na top_row (w lewym górnym rogu)
+    if buttons is not None and button_state is not None:
+        buttons.draw(top_row, button_state)
+
+    if panel_h and panel_h > 0:
+        panel = render_status_panel(top_row.shape[1], panel_h, params_lines, help_line=help_line)
+        return cv2.vconcat([top_row, panel])
+
+    return top_row
+

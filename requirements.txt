@@ -1,6 +1,4 @@
 # Minimal dependencies for ShadowDetection
-numpy
-opencv-python
-# Optional (use if you need 3D visualization tools or plotting)
-matplotlib
-
+numpy>=1.24
+opencv-python>=4.7
+Pillow>=10.0
