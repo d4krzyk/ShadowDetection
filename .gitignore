@@ -1,0 +1,114 @@
+# .gitignore for ShadowDetection project
+# -----------------------------
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Data (large image datasets)
+# Ignore raw/large data by default. If you want to keep small sample data,
+# add an exception (e.g. !data/small/)
+data/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.pdm-python
+.pdm-build/
+
+# Environment and secrets
+.env
+.envrc
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+
+# PyInstaller
+*.spec
+
+# Unit test / coverage
+.pytest_cache/
+pytest_cache/
+.coverage
+.coverage.*
+.cache
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs and reports
+*.log
+logs/
+
+# Database files
+*.sqlite3
+*.db
+
+# Model weights / outputs / results
+models/
+weights/
+checkpoints/
+outputs/
+results/
+predictions/
+*.h5
+*.pt
+*.ckpt
+*.pth
+
+# Pickles
+*.pkl
+*.pickle
+
+# IDE / editor
+.idea/
+*.iml
+*.iws
+
+# Ignore specific JetBrains files that should not be committed even if .idea is tracked
+.idea/deployment.xml
+.idea/workspace.xml
+.idea/caches/
+.idea/codestyles/
+.idea/shelf/
+.idea/copyright/
+
+# Copilot migration / assistant files in .idea
+.idea/copilot.data.migration.edit.xml
+.idea/copilot.data.migration.agent.xml
+
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc
+*.pyc
+*.pyo
+*.pyd
+
+# GitHub Copilot / AI assistant artifacts
+# Ignore local caches, suggestions and Copilot config files that should not be committed
+.copilot/
+.copilot-cache/
+.copilotrc
+.copilot-settings.json
+.github/copilot.*
+.github/Copilot.*
+*.suggestions.json
+*.code-suggestions
+.suggestions/
+
+# Keep gitignore file tracked obviously
+!.gitignore
