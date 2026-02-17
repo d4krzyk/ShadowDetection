@@ -3,13 +3,9 @@ import sys
 
 
 def main():
-    from src.gui_tuner import run_app
+    from src.gui.app import run_app
 
-    folder = os.path.join('data', 'SBU-shadow', 'SBUTrain', 'ShadowImages')
-    if len(sys.argv) > 1:
-        folder = sys.argv[1]
-
-    run_app(folder)
+    run_app()
 
 
 if __name__ == '__main__':

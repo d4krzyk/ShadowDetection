@@ -446,78 +446,20 @@ def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, w=170, h=300, t
         n = (vx * vx + vy * vy) ** 0.5 + 1e-6
         vx /= n
         vy /= n
-        ex = int(round(cx + vx * (r - 6)))
-        ey = int(round(cy + vy * (r - 6)))
+        conf = float(np.clip(float(confidence), 0.0, 1.0))
+        length = int(round((r - 6) * (0.35 + 0.65 * conf)))
+        ex = int(round(cx + vx * length))
+        ey = int(round(cy + vy * length))
         cv2.arrowedLine(canvas, (cx, cy), (ex, ey), (0, 255, 0), 2, tipLength=0.22)
 
     conf = float(np.clip(float(confidence), 0.0, 1.0))
     ang = float(angle_deg) % 360.0
-    cv2.putText(canvas, f"ang {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"conf {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Angle {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    cv2.putText(canvas, f"Confidence {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
 
     cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (60, 60, 60), 1)
     return canvas
 
-
-def render_status_panel(width, panel_h, params_text_lines, help_line=None, bg=(18, 18, 18)):
-    """Uniwersalny panel statusu pod obrazem.
-
-    params_text_lines: lista maks 3 linijek.
-    """
-    panel = np.full((int(panel_h), int(width), 3), bg, dtype=np.uint8)
-    y = 24
-    for i, line in enumerate(params_text_lines[:3]):
-        cv2.putText(panel, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (235, 235, 235), 1, cv2.LINE_AA)
-        y += 27
-    if help_line:
-        cv2.putText(panel, help_line, (12, int(panel_h) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (180, 180, 180), 1, cv2.LINE_AA)
-    return panel
-
-
-class ToggleButtons:
-    """Prosty panel klikalnych przycisków ON/OFF (bez suwaków).
-
-    Użycie:
-      buttons = ToggleButtons([('GEOM','use_geometry'), ('CLAHE','use_clahe')])
-      buttons.draw(frame)
-      if buttons.handle_click(x,y): ...
-    """
-
-    def __init__(self, items, origin=(10, 10), button_size=(120, 34), gap=10):
-        self.items = [(label, key) for (label, key) in items]
-        self.origin = (int(origin[0]), int(origin[1]))
-        self.button_size = (int(button_size[0]), int(button_size[1]))
-        self.gap = int(gap)
-
-    def layout(self):
-        x0, y0 = self.origin
-        bw, bh = self.button_size
-        rects = {}
-        x = x0
-        for label, key in self.items:
-            rects[key] = (x, y0, x + bw, y0 + bh, label)
-            x += bw + self.gap
-        return rects
-
-    def draw(self, img_bgr, state: dict):
-        rects = self.layout()
-        for key, (x1, y1, x2, y2, label) in rects.items():
-            on = bool(state.get(key, False))
-            fill = (40, 120, 40) if on else (60, 60, 60)
-            border = (90, 220, 90) if on else (140, 140, 140)
-            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), fill, -1)
-            cv2.rectangle(img_bgr, (x1, y1), (x2, y2), border, 2)
-            txt = f"{label}: {'ON' if on else 'OFF'}"
-            cv2.putText(img_bgr, txt, (x1 + 8, y1 + 23), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (245, 245, 245), 1, cv2.LINE_AA)
-        return img_bgr
-
-    def handle_click(self, x, y, state: dict):
-        rects = self.layout()
-        for key, (x1, y1, x2, y2, _label) in rects.items():
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                state[key] = not bool(state.get(key, False))
-                return key
-        return None
 
 
 def build_main_view(image_bgr,
@@ -529,13 +471,8 @@ def build_main_view(image_bgr,
                     light_conf,
                     view_w,
                     view_h,
-                    compass_w,
-                    panel_h,
-                    params_lines,
-                    help_line,
-                    buttons: ToggleButtons | None = None,
-                    button_state: dict | None = None):
-    """Składa główny widok: porównanie + kompas + (opcjonalnie) panel statusu.
+                    compass_w):
+    """Składa główny widok: porównanie + kompas.
 
     Zwraca: view_bgr
     """
@@ -556,14 +493,6 @@ def build_main_view(image_bgr,
         cv2.putText(compass, 'DIR OFF', (20, view_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
 
     top_row = cv2.hconcat([comp_fixed, compass])
-
-    # przyciski rysujemy na top_row (w lewym górnym rogu)
-    if buttons is not None and button_state is not None:
-        buttons.draw(top_row, button_state)
-
-    if panel_h and panel_h > 0:
-        panel = render_status_panel(top_row.shape[1], panel_h, params_lines, help_line=help_line)
-        return cv2.vconcat([top_row, panel])
 
     return top_row
 
