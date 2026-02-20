@@ -9,7 +9,7 @@ def _circular_hue_diff(h1, h2):
     return d.astype(np.uint8)
 
 
-def _dominant_line_angle_deg(edge_img, min_line_length=40, max_line_gap=10, hough_thresh=60):
+def _dominant_line_angle_deg(edge_img, min_line_length=40, max_line_gap=10, hough_thresh=60, return_lines=False):
     """Zwraca (angle_deg, confidence) z HoughLinesP.
 
     angle_deg w zakresie [0,180) opisuje orientację linii (nie wektora).
@@ -18,7 +18,7 @@ def _dominant_line_angle_deg(edge_img, min_line_length=40, max_line_gap=10, houg
     lines = cv2.HoughLinesP(edge_img, 1, np.pi / 180.0, threshold=int(hough_thresh),
                             minLineLength=int(min_line_length), maxLineGap=int(max_line_gap))
     if lines is None or len(lines) == 0:
-        return None, 0.0
+        return (None, 0.0, None) if return_lines else (None, 0.0)
 
     angs = []
     wts = []
@@ -35,7 +35,7 @@ def _dominant_line_angle_deg(edge_img, min_line_length=40, max_line_gap=10, houg
         wts.append(length)
 
     if not angs:
-        return None, 0.0
+        return (None, 0.0, lines) if return_lines else (None, 0.0)
 
     angs = np.array(angs, dtype=np.float32)
     wts = np.array(wts, dtype=np.float32)
@@ -48,7 +48,37 @@ def _dominant_line_angle_deg(edge_img, min_line_length=40, max_line_gap=10, houg
     R = ((c * c + s * s) ** 0.5) / (float(np.sum(wts)) + 1e-6)
     conf = float(np.clip(R, 0.0, 1.0))
 
+    if return_lines:
+        return float(np.degrees(mean)), conf, lines
     return float(np.degrees(mean)), conf
+
+
+def _compute_ratio_mask(v8, blur_sizes=(15, 31, 61), ratio_thresholds=(0.75, 0.70, 0.65)):
+    """Multi-scale V / blur(V) ratio mask. Returns (mask, ratio_maps, ratio_min)."""
+    ratio_maps = []
+    masks = []
+    v = v8.astype(np.float32) + 1e-6
+    for k, thr in zip(blur_sizes, ratio_thresholds):
+        kk = int(max(3, k))
+        if kk % 2 == 0:
+            kk += 1
+        bg = cv2.medianBlur(v8, kk).astype(np.float32) + 1e-6
+        ratio = v / bg
+        ratio_maps.append(ratio)
+        masks.append((ratio < float(thr)).astype(np.uint8) * 255)
+
+    if not masks:
+        return np.zeros_like(v8), [], None
+
+    ratio_mask = masks[0]
+    for m in masks[1:]:
+        ratio_mask = cv2.bitwise_or(ratio_mask, m)
+
+    ratio_min = ratio_maps[0]
+    for r in ratio_maps[1:]:
+        ratio_min = np.minimum(ratio_min, r)
+
+    return ratio_mask, ratio_maps, ratio_min
 
 
 def detect_shadow_physics(
@@ -56,30 +86,28 @@ def detect_shadow_physics(
         v_thresh=75,
         hue_window=31,
         hue_diff_max=10,
-        min_area=250,
+        min_area=200,
         min_elongation=1.3,
         morph_kernel=5,
         # local contrast (luminance) enhancement
         use_clahe=True,
         clahe_clip_limit=2.0,
         clahe_tile_grid_size=(8, 8),
+        # ratio thresholds (multi-scale V/blur(V))
+        ratio_blur_sizes=(15, 31, 61),
+        ratio_thresholds=(0.75, 0.70, 0.65),
+        # soft grayscale shadow score
+        use_soft_shadow=True,
+        soft_shadow_thresh=0.20,
+        soft_shadow_scale=0.40,
         # geometry validation (binary filter)
         use_geometry_validation=True,
         min_line_conf=0.35,
         debug=False,
 ):
-    """Detekcja cieni zgodna z prostą fizyką (poprzednia wersja):
+    """Detekcja cieni na podstawie luminancji i spojnosc koloru.
 
-    1) BGR + GaussianBlur(5x5)
-    2) HSV split
-    3) kandydaci: V < v_thresh
-    4) odrzucenie ciemnych obiektów: spójność H względem lokalnej średniej (circular)
-    5) morfologia: close -> open
-    6) filtrowanie komponentów: area + elongation
-    7) walidacja kierunkowa: Canny+Hough w ROI komponentu (min_line_conf)
-    8) maska binarna 0/255
-
-    Zwraca maskę; gdy debug=True zwraca (mask, dbg_dict).
+    Zwraca maskę 0/255; gdy debug=True zwraca (mask, dbg_dict).
     """
     if image_bgr is None:
         raise ValueError('Pusty obraz')
@@ -90,6 +118,7 @@ def detect_shadow_physics(
 
     # CLAHE na luminancji (V) — podbija lokalny kontrast bez zmiany H/S.
     if use_clahe:
+        # lokalny kontrast tylko na V
         try:
             tg = (int(clahe_tile_grid_size[0]), int(clahe_tile_grid_size[1]))
             tg = (max(2, tg[0]), max(2, tg[1]))
@@ -100,10 +129,24 @@ def detect_shadow_physics(
         clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tg)
         v = clahe.apply(v)
 
-    # 3) kandydaci na cień (jasność)
-    v_mask = (v < int(v_thresh)).astype(np.uint8) * 255
+    v8 = v
 
-    # 4) spójność koloru: lokalna średnia H (circular mean sin/cos)
+    # kandydaci cienia: V i V/blur(V)
+    v_mask = (v8 < int(v_thresh)).astype(np.uint8) * 255
+    ratio_mask, ratio_maps, ratio_min = _compute_ratio_mask(v8, ratio_blur_sizes, ratio_thresholds)
+
+    soft_mask = None
+    shadow_score = None
+    if use_soft_shadow and ratio_min is not None:
+        # shadow_score 0..1, higher = darker relative to local background
+        shadow_score = np.clip((1.0 - ratio_min) / float(max(1e-3, soft_shadow_scale)), 0.0, 1.0)
+        soft_mask = (shadow_score >= float(soft_shadow_thresh)).astype(np.uint8) * 255
+        base_mask = cv2.bitwise_or(v_mask, ratio_mask)
+        base_mask = cv2.bitwise_or(base_mask, soft_mask)
+    else:
+        base_mask = cv2.bitwise_or(v_mask, ratio_mask)
+
+    # spojnosc barwy (H) wzgledem lokalnej sredniej
     k = int(max(3, hue_window))
     if k % 2 == 0:
         k += 1
@@ -120,9 +163,9 @@ def detect_shadow_physics(
     hue_diff = _circular_hue_diff(h, mean_h)
     hue_ok = (hue_diff <= int(hue_diff_max)).astype(np.uint8) * 255
 
-    cand = cv2.bitwise_and(v_mask, hue_ok)
+    cand = cv2.bitwise_and(base_mask, hue_ok)
 
-    # 5) morfologia
+    # morfologia
     mk = int(max(3, morph_kernel))
     if mk % 2 == 0:
         mk += 1
@@ -130,10 +173,12 @@ def detect_shadow_physics(
     cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, kernel)
     cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, kernel)
 
-    # 6) komponenty + elongation
+    # komponenty + elongation
     num, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
     out = np.zeros_like(cand)
     dbg_regions = []
+    dbg_lines = []
+    weight_map = np.zeros_like(cand, dtype=np.float32)
 
     for i in range(1, num):
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -152,23 +197,42 @@ def detect_shadow_physics(
         region_mask = (labels[y:y + h0, x:x + w] == i).astype(np.uint8) * 255
         line_angle = None
         line_conf = 0.0
+        line_weight = 0.0
 
-        # 7) geometria jako filtr binarny
+        # 7) geometria jako waga, nie filtr
         if use_geometry_validation:
-            roi_v = v[y:y + h0, x:x + w]
+            # Hough jako waga pewnosci kierunku w regionie
+            roi_v = v8[y:y + h0, x:x + w]
             edges = cv2.Canny(roi_v, 50, 150)
             edges = cv2.bitwise_and(edges, region_mask)
 
-            line_angle, line_conf = _dominant_line_angle_deg(
-                edges,
-                min_line_length=max(20, min(w, h0) // 3),
-                max_line_gap=10,
-                hough_thresh=40,
-            )
-            if line_conf < float(min_line_conf):
-                continue
+            if debug:
+                line_angle, line_conf, lines = _dominant_line_angle_deg(
+                    edges,
+                    min_line_length=max(20, min(w, h0) // 3),
+                    max_line_gap=10,
+                    hough_thresh=40,
+                    return_lines=True,
+                )
+                if lines is not None:
+                    for l in lines[:, 0, :]:
+                        x1, y1, x2, y2 = [int(vv) for vv in l]
+                        dbg_lines.append((x1 + x, y1 + y, x2 + x, y2 + y))
+            else:
+                line_angle, line_conf = _dominant_line_angle_deg(
+                    edges,
+                    min_line_length=max(20, min(w, h0) // 3),
+                    max_line_gap=10,
+                    hough_thresh=40,
+                )
+
+        if float(min_line_conf) > 1e-6:
+            line_weight = float(np.clip(float(line_conf) / float(min_line_conf), 0.0, 1.0))
+        else:
+            line_weight = float(np.clip(float(line_conf), 0.0, 1.0))
 
         out[y:y + h0, x:x + w] = cv2.bitwise_or(out[y:y + h0, x:x + w], region_mask)
+        weight_map[y:y + h0, x:x + w] = np.maximum(weight_map[y:y + h0, x:x + w], float(line_weight))
 
         if debug:
             dbg_regions.append({
@@ -177,22 +241,42 @@ def detect_shadow_physics(
                 'elongation': float(elong),
                 'line_angle_deg': None if line_angle is None else float(line_angle),
                 'line_conf': float(line_conf),
+                'line_weight': float(line_weight),
             })
 
     if not debug:
         return out
 
+    # debug maps
+    v_f = v8.astype(np.float32)
+    gx = cv2.Sobel(v_f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(v_f, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = cv2.magnitude(gx, gy)
+
+    chroma_diff = None
+    try:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
+        lab_blur = cv2.GaussianBlur(lab, (31, 31), 0)
+        ab = lab[:, :, 1:3] / 255.0
+        ab_blur = lab_blur[:, :, 1:3] / 255.0
+        chroma_diff = np.linalg.norm(ab - ab_blur, axis=2)
+    except Exception:
+        chroma_diff = None
+
     dbg = {
         'v_mask': v_mask,
+        'ratio_mask': ratio_mask,
+        'ratio_maps': ratio_maps,
+        'ratio_min': ratio_min,
+        'soft_mask': soft_mask,
+        'shadow_score': shadow_score,
         'hue_ok': hue_ok,
         'cand_after_morph': cand,
+        'grad_mag': grad_mag,
+        'chroma_diff': chroma_diff,
         'regions': dbg_regions,
+        'lines': dbg_lines,
+        'weight_map': weight_map,
     }
     return out, dbg
 
-
-# Backward-compat alias (tymczasowo), żeby reszta repo się nie wywaliła.
-# Nowy kod powinien używać detect_shadow_physics.
-
-def detect_shadow(image_bgr, **kwargs):
-    return detect_shadow_physics(image_bgr, **kwargs)

@@ -2,10 +2,19 @@ import threading
 import time
 
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
 
 from src.shadow_detection import detect_shadow_physics
-from src.shadow_direction import fuse_light_vectors
+from src.shadow_direction import (
+    estimate_light_direction_bgr,
+    estimate_light_direction_shadow_edges,
+    estimate_light_direction_shadow_edge_gradient,
+    estimate_from_mask_pca_tip,
+    is_object_visible_opposite_shadow,
+    merge_vectors,
+    _normalize2,
+)
 from src.visualize import build_main_view
 
 
@@ -28,6 +37,13 @@ class RenderWorkerMixin:
             "use_geometry": bool(self.var_use_geom.get()),
             "use_clahe": bool(self.var_use_clahe.get()),
             "overlay": bool(self.var_overlay.get()),
+            "use_soft_shadow": bool(self.var_soft_shadow.get()),
+            "soft_shadow_thresh": float(self._clamp_int(self.var_soft_shadow_thresh_x100.get(), 5, 90)) / 100.0,
+            "soft_shadow_scale": float(self._clamp_int(self.var_soft_shadow_scale_x100.get(), 10, 120)) / 100.0,
+            "show_soft_mask": bool(self.var_show_soft_mask.get()),
+            "use_dir_hough": bool(self.var_use_dir_hough.get()),
+            "use_dir_pca": bool(self.var_use_dir_pca.get()),
+            "use_dir_grad": bool(self.var_use_dir_grad.get()),
         }
 
     def _schedule_render(self, reason: str = "param"):
@@ -54,27 +70,82 @@ class RenderWorkerMixin:
                 continue
 
             t0 = time.time()
-            mask = detect_shadow_physics(
-                img,
-                use_geometry_validation=params["use_geometry"],
-                use_clahe=params["use_clahe"],
-                v_thresh=params["v_thresh"],
-                hue_diff_max=params["hue_diff_max"],
-                min_area=params["min_area"],
-                min_elongation=params["min_elongation"],
-                morph_kernel=params["morph_kernel"],
-                min_line_conf=params["min_line_conf"],
-            )
+            if params["use_soft_shadow"]:
+                mask, dbg = detect_shadow_physics(
+                    img,
+                    use_geometry_validation=params["use_geometry"],
+                    use_clahe=params["use_clahe"],
+                    v_thresh=params["v_thresh"],
+                    hue_diff_max=params["hue_diff_max"],
+                    min_area=params["min_area"],
+                    min_elongation=params["min_elongation"],
+                    morph_kernel=params["morph_kernel"],
+                    min_line_conf=params["min_line_conf"],
+                    use_soft_shadow=params["use_soft_shadow"],
+                    soft_shadow_thresh=params["soft_shadow_thresh"],
+                    soft_shadow_scale=params["soft_shadow_scale"],
+                    debug=True,
+                )
+                overlay_mask = dbg.get("shadow_score") if isinstance(dbg, dict) else None
+            else:
+                mask = detect_shadow_physics(
+                    img,
+                    use_geometry_validation=params["use_geometry"],
+                    use_clahe=params["use_clahe"],
+                    v_thresh=params["v_thresh"],
+                    hue_diff_max=params["hue_diff_max"],
+                    min_area=params["min_area"],
+                    min_elongation=params["min_elongation"],
+                    morph_kernel=params["morph_kernel"],
+                    min_line_conf=params["min_line_conf"],
+                    use_soft_shadow=params["use_soft_shadow"],
+                    soft_shadow_thresh=params["soft_shadow_thresh"],
+                    soft_shadow_scale=params["soft_shadow_scale"],
+                )
+                overlay_mask = None
+
+            use_soft = bool(params.get("show_soft_mask", True))
+            display_mask = overlay_mask if (use_soft and overlay_mask is not None) else mask
 
             vec, conf, ang = None, 0.0, 0.0
             try:
-                ang, vec, conf = fuse_light_vectors(img, mask, debug=False)
+                use_h = bool(params.get("use_dir_hough", True))
+                use_p = bool(params.get("use_dir_pca", True))
+                use_g = bool(params.get("use_dir_grad", True))
+                if not (use_h or use_p or use_g):
+                    use_h = use_p = use_g = True
+
+                components = []
+
+                if use_h:
+                    ang_h, vec_h, conf_h = estimate_light_direction_shadow_edges(img)
+                    components.append({"name": "hough", "vec": vec_h, "conf": float(conf_h)})
+
+                if use_g:
+                    ang_g, vec_g, conf_g = estimate_light_direction_shadow_edge_gradient(img, mask, weight_map=overlay_mask)
+                    components.append({"name": "grad_edge", "vec": vec_g, "conf": float(max(0.10, conf_g))})
+
+                if use_p:
+                    pca_out = estimate_from_mask_pca_tip(mask, weight_map=overlay_mask, debug=True)
+                    v_m, conf_m, _dbg_m = pca_out
+                    visible, conf_obj, _dbg_obj = is_object_visible_opposite_shadow(
+                        img,
+                        mask,
+                        _normalize2(-np.array(v_m, dtype=np.float32)),
+                        debug=True,
+                    )
+                    conf_m2 = float(np.clip(conf_m + 0.25 * conf_obj, 0.0, 1.0))
+                    components.append({"name": "mask", "vec": v_m, "conf": conf_m2})
+
+                v_final, conf = merge_vectors(components)
+                ang = (np.degrees(np.arctan2(float(v_final[1]), float(v_final[0]))) + 360.0) % 360.0
+                vec = (float(v_final[0]), float(v_final[1]))
             except Exception:
                 pass
 
             view = build_main_view(
                 img,
-                mask,
+                display_mask,
                 overlay=params["overlay"],
                 show_direction=True,
                 light_vec=vec,
@@ -99,6 +170,10 @@ class RenderWorkerMixin:
         if latest is not None:
             _req_id, view_bgr, _mask, ms = latest
             if view_bgr is not None:
+                target_w = int(self.preview_label.winfo_width() or 0)
+                target_h = int(self.preview_label.winfo_height() or 0)
+                if target_w > 10 and target_h > 10:
+                    view_bgr = cv2.resize(view_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
                 rgb = cv2.cvtColor(view_bgr, cv2.COLOR_BGR2RGB)
                 im = Image.fromarray(rgb)
                 tk_img = ImageTk.PhotoImage(im)
@@ -110,4 +185,3 @@ class RenderWorkerMixin:
                 self.status_var.set(f"{name} | {ms:.0f} ms")
 
         self.after(50, self._poll_results)
-

@@ -65,6 +65,24 @@ class UiMixin:
             31,
             desc="Wyżej: mocniejsze domykanie/otwieranie; niżej: delikatniejsze.",
         )
+        r = self._add_scale(
+            params_frame,
+            r,
+            "soft_thresh*100 (5-60)",
+            self.var_soft_shadow_thresh_x100,
+            5,
+            60,
+            desc="Niżej: lapie slabsze, rozproszone cienie.",
+        )
+        r = self._add_scale(
+            params_frame,
+            r,
+            "soft_scale*100 (10-80)",
+            self.var_soft_shadow_scale_x100,
+            10,
+            80,
+            desc="Wyżej: mniej agresywne uznawanie ciemnosci za cien.",
+        )
 
         opts_frame = ttk.LabelFrame(left, text="Opcje", padding=8)
         opts_frame.grid(row=1, column=0, sticky="ew", pady=(8, 0))
@@ -73,6 +91,11 @@ class UiMixin:
         ttk.Checkbutton(opts_frame, text="GEOM (walidacja geometryczna)", variable=self.var_use_geom, command=self._schedule_render).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(opts_frame, text="CLAHE (lokalny kontrast)", variable=self.var_use_clahe, command=self._schedule_render).grid(row=1, column=0, sticky="w")
         ttk.Checkbutton(opts_frame, text="Overlay (maska jako nakladka)", variable=self.var_overlay, command=self._schedule_render).grid(row=2, column=0, sticky="w")
+        ttk.Checkbutton(opts_frame, text="Soft shadow (grayscale)", variable=self.var_soft_shadow, command=self._schedule_render).grid(row=3, column=0, sticky="w")
+        ttk.Checkbutton(opts_frame, text="Pokaz soft mask", variable=self.var_show_soft_mask, command=self._schedule_render).grid(row=4, column=0, sticky="w")
+        ttk.Checkbutton(opts_frame, text="Dir: Hough", variable=self.var_use_dir_hough, command=self._schedule_render).grid(row=5, column=0, sticky="w")
+        ttk.Checkbutton(opts_frame, text="Dir: PCA", variable=self.var_use_dir_pca, command=self._schedule_render).grid(row=6, column=0, sticky="w")
+        ttk.Checkbutton(opts_frame, text="Dir: Gradient", variable=self.var_use_dir_grad, command=self._schedule_render).grid(row=7, column=0, sticky="w")
 
         btns = ttk.Frame(left)
         btns.grid(row=2, column=0, sticky="ew", pady=(8, 0))

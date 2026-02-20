@@ -59,6 +59,8 @@ class ShadowTunerApp(tk.Tk, UiMixin, SourceDialogMixin, MediaPlayerMixin, Render
         self._worker_thread = None
         self._result_q: queue.Queue = queue.Queue()
 
+        self._prev_light_vec = None
+
         self.VIEW_W = 800
         self.VIEW_H = 650
         self.COMPASS_W = 180
@@ -68,6 +70,14 @@ class ShadowTunerApp(tk.Tk, UiMixin, SourceDialogMixin, MediaPlayerMixin, Render
         self.var_min_area = tk.IntVar(value=250)
         self.var_min_elong_x100 = tk.IntVar(value=130)
         self.var_morph_kernel = tk.IntVar(value=5)
+        self.var_soft_shadow = tk.BooleanVar(value=True)
+        self.var_soft_shadow_thresh_x100 = tk.IntVar(value=20)
+        self.var_soft_shadow_scale_x100 = tk.IntVar(value=40)
+        self.var_show_soft_mask = tk.BooleanVar(value=True)
+
+        self.var_use_dir_hough = tk.BooleanVar(value=True)
+        self.var_use_dir_pca = tk.BooleanVar(value=True)
+        self.var_use_dir_grad = tk.BooleanVar(value=True)
 
         self.var_use_geom = tk.BooleanVar(value=True)
         self.var_use_clahe = tk.BooleanVar(value=True)
@@ -75,6 +85,7 @@ class ShadowTunerApp(tk.Tk, UiMixin, SourceDialogMixin, MediaPlayerMixin, Render
 
         self._build_ui()
         self._bind_events()
+        self.preview_label.bind("<Configure>", self._on_preview_resize)
 
         if self._source_mode == "folder" and self.images_folder:
             self.img_path = get_random_image_from_dir(self.images_folder, include_video=True)
@@ -179,6 +190,14 @@ class ShadowTunerApp(tk.Tk, UiMixin, SourceDialogMixin, MediaPlayerMixin, Render
             self.status_var.set(f"Zapisano: {out_path}")
         except Exception as e:
             self.status_var.set(f"Blad zapisu: {e}")
+
+    def _on_preview_resize(self, event):
+        w = int(max(360, getattr(event, "width", 0)))
+        h = int(max(260, getattr(event, "height", 0)))
+        if w != self.VIEW_W or h != self.VIEW_H:
+            self.VIEW_W = w
+            self.VIEW_H = h
+            self._schedule_render(reason="resize")
 
 
 def run_app(images_folder: str | None = None):

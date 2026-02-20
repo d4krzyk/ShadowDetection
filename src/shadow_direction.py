@@ -2,16 +2,88 @@ import cv2
 import numpy as np
 
 
+def _largest_connected_component(mask_u8):
+    """Zwraca maskę największej składowej (0/255)."""
+    if mask_u8 is None:
+        return None
+
+    m = mask_u8
+    if len(m.shape) == 3:
+        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+
+    if m.dtype != np.uint8:
+        mm = m.astype(np.float32)
+        if mm.max() <= 1.0:
+            mm *= 255.0
+        m = np.clip(mm, 0, 255).astype(np.uint8)
+
+    if int(np.count_nonzero(m)) == 0:
+        return np.zeros_like(m)
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return (m > 0).astype(np.uint8) * 255
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    idx = int(np.argmax(areas)) + 1
+    return (labels == idx).astype(np.uint8) * 255
+
+
+def _normalize2(v):
+    v = np.array(v, dtype=np.float32).reshape(2)
+    n = float(np.linalg.norm(v))
+    if n < 1e-6:
+        return np.array([1.0, 0.0], dtype=np.float32)
+    return v / n
+
+
+def merge_vectors(components):
+    """Laczy wektory kierunku z wagami confidence.
+
+    components: lista dictow z kluczami 'vec' i 'conf'.
+    Zwraca: (vec_xy, confidence)
+    """
+    if not components:
+        return (1.0, 0.0), 0.0
+
+    vecs = []
+    wts = []
+    for c in components:
+        if not c:
+            continue
+        v = c.get('vec')
+        w = float(c.get('conf', 0.0))
+        if v is None or w <= 1e-6:
+            continue
+        vecs.append(_normalize2(v))
+        wts.append(w)
+
+    if not vecs:
+        return (1.0, 0.0), 0.0
+
+    ref = vecs[0]
+    aligned = [(-v if float(np.dot(v, ref)) < 0 else v) for v in vecs]
+
+    V = np.vstack(aligned)
+    W = np.array(wts, dtype=np.float32).reshape(-1, 1)
+    v_final = _normalize2(np.sum(V * W, axis=0))
+
+    dots = [float(np.dot(v_final, v)) for v in aligned]
+    agree = float(np.clip((np.mean(dots) + 1.0) / 2.0, 0.0, 1.0))
+    avg_conf = float(np.clip(float(np.mean(wts)), 0.0, 1.0))
+    conf = float(np.clip(agree * avg_conf, 0.0, 1.0))
+
+    return (float(v_final[0]), float(v_final[1])), float(conf)
+
+
+
+
 def estimate_light_direction_bgr(image_bgr):
-    """Szacuje kierunek światła w obrazie.
+    """Szacuje kierunek światła na podstawie dominujacego gradientu jasnosci.
 
     Zwraca:
-    - angle_deg: kąt w stopniach (0..360), gdzie 0=→ (oś X dodatnia), 90=↓
-    - vec: (vx, vy) jednostkowy wektor kierunku
-
-    Heurystyka: liczymy gradient jasności (Sobel) i bierzemy histogram orientacji gradientu.
-    Cień zwykle powoduje granice (spadek V), a kierunek światła jest w przybliżeniu prostopadły
-    do dominujących krawędzi cienia. To jest tylko wskazówka (nie zawsze poprawna), ale pomaga.
+    - angle_deg: kąt 0..360 (0=→, 90=↓)
+    - vec: (vx, vy) jednostkowy wektor
     """
     if image_bgr is None:
         raise ValueError("Pusty obraz")
@@ -23,27 +95,22 @@ def estimate_light_direction_bgr(image_bgr):
     gy = cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3)
 
     mag = cv2.magnitude(gx, gy)
-    ang = cv2.phase(gx, gy, angleInDegrees=True)  # 0..360
+    ang = cv2.phase(gx, gy, angleInDegrees=True)
 
-    # weź tylko mocne krawędzie
     thr = float(np.percentile(mag, 90))
     thr2 = thr if thr > 5.0 else 5.0
     mask = mag >= thr2
     if mask.sum() < 50:
-        # fallback
         return 0.0, (1.0, 0.0)
 
     ang_sel = ang[mask]
     mag_sel = mag[mask]
 
-    # histogram 36 binów
     bins = 36
     hist, edges = np.histogram(ang_sel, bins=bins, range=(0.0, 360.0), weights=mag_sel)
     best_bin = int(hist.argmax())
     best_angle = (edges[best_bin] + edges[best_bin + 1]) / 2.0
 
-    # Kierunek światła ~ przeciwny do gradientu spadku jasności.
-    # Gradient wskazuje kierunek wzrostu jasności, więc światło jest podobne do gradientu.
     angle_rad = np.deg2rad(best_angle)
     vx = float(np.cos(angle_rad))
     vy = float(np.sin(angle_rad))
@@ -61,21 +128,10 @@ def estimate_light_direction_shadow_edges(image_bgr,
                                          max_line_gap=10):
     """Szacunek kierunku światła na podstawie krawędzi cieni.
 
-    Pipeline:
-    1) Liczymy mapę pikseli "shadow-boundary-like":
-       - duży gradient jasności V
-       - mała zmiana chromy (Lab a/b) w poprzek krawędzi (w przybliżeniu: lab vs blur)
-       - preferujemy spadek V (ciemniej) względem tła (V/medianBlur(V))
-    2) Canny na V i maskujemy tylko shadow-like
-    3) HoughLinesP na maskowanych krawędziach
-    4) Dominująca orientacja linii => kierunek światła to wektor prostopadły do linii
-
     Zwraca:
     - angle_deg (0..360)
     - vec_xy (vx, vy)
     - confidence (0..1)
-
-    Uwaga: to nadal 2D na płaszczyźnie obrazu.
     """
     if image_bgr is None:
         raise ValueError('Pusty obraz')
@@ -84,12 +140,10 @@ def estimate_light_direction_shadow_edges(image_bgr,
     v = hsv[:, :, 2].astype(np.float32)
     v8 = hsv[:, :, 2]
 
-    # local background and ratio test (shadow should be darker)
     bg = cv2.medianBlur(v8, 31).astype(np.float32) + 1e-6
     ratio = (v + 1e-6) / bg
     shadowish = ratio < (1.0 - float(v_drop_min))
 
-    # chroma difference small
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     lab_blur = cv2.GaussianBlur(lab, (31, 31), 0)
     ab = lab[:, :, 1:3] / 255.0
@@ -97,7 +151,6 @@ def estimate_light_direction_shadow_edges(image_bgr,
     chroma_diff = np.linalg.norm(ab - ab_blur, axis=2)
     chroma_ok = chroma_diff < float(chroma_diff_max)
 
-    # gradient magnitude on V
     gx = cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3)
     gmag = cv2.magnitude(gx, gy)
@@ -106,21 +159,16 @@ def estimate_light_direction_shadow_edges(image_bgr,
 
     boundary_like = (shadowish & chroma_ok & grad_ok)
 
-    # edges
     edges = cv2.Canny(v8, int(canny1), int(canny2))
     edges = cv2.bitwise_and(edges, (boundary_like.astype(np.uint8) * 255))
 
-    # Hough lines
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=int(hough_thresh),
                             minLineLength=int(min_line_len), maxLineGap=int(max_line_gap))
 
     if lines is None or len(lines) == 0:
-        # fallback to gradient-based method
         ang, vec = estimate_light_direction_bgr(image_bgr)
         return ang, vec, 0.0
 
-    # accumulate orientation of lines weighted by length
-    # line angle in image coords: atan2(dy, dx)
     angs = []
     wts = []
     for l in lines[:, 0, :]:
@@ -130,7 +178,7 @@ def estimate_light_direction_shadow_edges(image_bgr,
         length = (dx * dx + dy * dy) ** 0.5
         if length < 1.0:
             continue
-        theta = np.arctan2(dy, dx)  # -pi..pi
+        theta = np.arctan2(dy, dx)
         angs.append(theta)
         wts.append(length)
 
@@ -141,23 +189,16 @@ def estimate_light_direction_shadow_edges(image_bgr,
     angs = np.array(angs, dtype=np.float32)
     wts = np.array(wts, dtype=np.float32)
 
-    # circular mean for line orientation (mod pi, because line direction is ambiguous)
-    # Use doubling trick: angle*2 then mean, then /2.
     c = np.sum(np.cos(2 * angs) * wts)
     s = np.sum(np.sin(2 * angs) * wts)
-    mean_line = 0.5 * np.arctan2(s, c)  # -pi/2..pi/2
+    mean_line = 0.5 * np.arctan2(s, c)
 
-    # confidence from resultant length
     R = float(((c * c + s * s) ** 0.5) / (float(np.sum(wts)) + 1e-6))
     confidence = float(np.clip(R, 0.0, 1.0))
 
-    # Light direction is perpendicular to line orientation.
-    # Choose one of the two perpendiculars by preferring direction that points from darker to brighter
-    # Approx: use global gradient direction estimate as tie-breaker.
     cand1 = mean_line + np.pi / 2.0
     cand2 = mean_line - np.pi / 2.0
 
-    # get gradient-based vector as hint
     ang_g, vec_g = estimate_light_direction_bgr(image_bgr)
     vg = np.array(vec_g, dtype=np.float32)
 
@@ -175,46 +216,98 @@ def estimate_light_direction_shadow_edges(image_bgr,
     return float(angle_deg), vec_xy, confidence
 
 
-def _normalize2(v):
-    v = np.array(v, dtype=np.float32).reshape(2)
-    n = float(np.linalg.norm(v))
-    if n < 1e-6:
-        return np.array([1.0, 0.0], dtype=np.float32)
-    return v / n
+def estimate_light_direction_shadow_edge_gradient(image_bgr, shadow_mask, weight_map=None, edge_ring=2, debug=False):
+    """Kierunek z gradientu luminancji liczony tylko na krawędzi cienia.
+
+    To zwykle stabilniejsze niż globalny gradient, bo ograniczamy się do miejsca,
+    gdzie cień faktycznie zmienia jasność.
+
+    Zwraca: (angle_deg, vec_xy, confidence) lub +dbg gdy debug=True.
+    """
+    if image_bgr is None or shadow_mask is None:
+        out = (0.0, (1.0, 0.0), 0.0)
+        return (*out, {'reason': 'missing'}) if debug else out
+
+    m = shadow_mask
+    if len(m.shape) == 3:
+        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+    if m.dtype != np.uint8:
+        mm = m.astype(np.float32)
+        if mm.max() <= 1.0:
+            mm *= 255.0
+        m = np.clip(mm, 0, 255).astype(np.uint8)
+
+    if int(np.count_nonzero(m)) < 50:
+        out = (0.0, (1.0, 0.0), 0.0)
+        return (*out, {'reason': 'too_few_mask_pixels'}) if debug else out
+
+    # bardzo cienki pierścień na granicy maski
+    k = int(max(1, edge_ring))
+    k = min(k, 7)
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+    edge = cv2.morphologyEx((m > 0).astype(np.uint8) * 255, cv2.MORPH_GRADIENT, ker)
+    edge = (edge > 0)
+
+    if int(np.count_nonzero(edge)) < 30:
+        out = (0.0, (1.0, 0.0), 0.0)
+        return (*out, {'reason': 'too_few_edge_pixels'}) if debug else out
+
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2].astype(np.float32)
+
+    gx = cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3)
+
+    ys, xs = np.where(edge)
+    gxs = gx[ys, xs]
+    gys = gy[ys, xs]
+    mag = np.sqrt(gxs * gxs + gys * gys) + 1e-6
+
+    # wagi: siła gradientu * opcjonalna waga z mapy (np. shadow_score 0..1)
+    w = mag.copy()
+    if weight_map is not None:
+        wm = weight_map
+        if len(wm.shape) == 3:
+            wm = cv2.cvtColor(wm, cv2.COLOR_BGR2GRAY)
+        if wm.shape[:2] != v.shape[:2]:
+            wm = cv2.resize(wm, (v.shape[1], v.shape[0]), interpolation=cv2.INTER_LINEAR)
+        wm = wm.astype(np.float32)
+        if float(wm.max()) > 1.5:
+            wm = wm / 255.0
+        w = w * np.clip(wm[ys, xs], 0.0, 1.0)
+
+    vx = gxs / mag
+    vy = gys / mag
+
+    sx = float(np.sum(vx * w))
+    sy = float(np.sum(vy * w))
+    norm = float((sx * sx + sy * sy) ** 0.5)
+
+    if norm < 1e-6:
+        out = (0.0, (1.0, 0.0), 0.0)
+        return (*out, {'reason': 'zero_resultant'}) if debug else out
+
+    v_out = (sx / norm, sy / norm)
+
+    # confidence = spójność kierunków na krawędzi
+    conf = float(np.clip(norm / (float(np.sum(w)) + 1e-6), 0.0, 1.0))
+    ang = (np.degrees(np.arctan2(v_out[1], v_out[0])) + 360.0) % 360.0
+
+    if not debug:
+        return float(ang), (float(v_out[0]), float(v_out[1])), float(conf)
+
+    dbg = {
+        'edge_pixels': int(xs.size),
+        'sum_w': float(np.sum(w)),
+        'norm': float(norm),
+    }
+    return float(ang), (float(v_out[0]), float(v_out[1])), float(conf), dbg
 
 
-def _circular_mean_pi(angs_rad, wts=None):
-    """Średnia kołowa dla orientacji linii (mod pi). Zwraca (mean, R)."""
-    angs = np.array(angs_rad, dtype=np.float32).reshape(-1)
-    if angs.size == 0:
-        return 0.0, 0.0
-    if wts is None:
-        w = np.ones_like(angs, dtype=np.float32)
-    else:
-        w = np.array(wts, dtype=np.float32).reshape(-1)
-        if w.size != angs.size:
-            w = np.ones_like(angs, dtype=np.float32)
+def estimate_from_mask_pca_tip(shadow_mask, weight_map=None, min_pixels=300, tip_quantile=0.92, debug=False):
+    """PCA na masce cienia (największa składowa) z opcjonalnymi wagami szarosci.
 
-    c = float(np.sum(np.cos(2 * angs) * w))
-    s = float(np.sum(np.sin(2 * angs) * w))
-    mean = 0.5 * float(np.arctan2(s, c))
-    R = float(((c * c + s * s) ** 0.5) / (float(np.sum(w)) + 1e-6))
-    return float(mean), float(np.clip(R, 0.0, 1.0))
-
-
-def estimate_from_mask_pca_tip(shadow_mask, min_pixels=300, tip_quantile=0.92, debug=False):
-    """Estymuje kierunek cienia (a więc przeciwny do światła) z maski binarnej.
-
-    Idea:
-    - PCA daje dominującą oś obszaru cienia (orientacja, bez zwrotu).
-    - "Tip" (czubek) wybieramy jako fragment maski najdalej wzdłuż osi PCA.
-    - Zwrot osi ustawiamy tak, żeby wektor wskazywał od centroidu do tipa.
-    - Confidence rośnie gdy obszar jest wydłużony (ratio eigenvalues) i jest wystarczająco duży.
-
-    Zwraca:
-      shadow_dir_xy (2,) jednostkowy wektor (kierunek *cienia* w obrazie)
-      confidence (0..1)
-      dbg (opcjonalnie)
+    Zwraca wektor od tip -> centroid oraz confidence 0..1.
     """
     if shadow_mask is None:
         raise ValueError('Pusta maska')
@@ -224,18 +317,45 @@ def estimate_from_mask_pca_tip(shadow_mask, min_pixels=300, tip_quantile=0.92, d
     else:
         m = shadow_mask
 
-    pts = np.column_stack(np.where(m > 0))  # (y,x)
+    if m.dtype != np.uint8:
+        mm = m.astype(np.float32)
+        if mm.max() <= 1.0:
+            mm = mm * 255.0
+        m = np.clip(mm, 0, 255).astype(np.uint8)
+
+    m = _largest_connected_component(m)
+
+    pts = np.column_stack(np.where(m > 0))
     if pts.shape[0] < int(min_pixels):
         v = np.array([1.0, 0.0], dtype=np.float32)
         return (v, 0.0, {'reason': 'too_few_pixels', 'n': int(pts.shape[0])}) if debug else (v, 0.0)
 
-    # PCA na (x,y)
     xy = pts[:, ::-1].astype(np.float32)  # (x,y)
-    mean = xy.mean(axis=0)
-    X = xy - mean
 
-    cov = (X.T @ X) / float(max(1, X.shape[0] - 1))
-    evals, evecs = np.linalg.eigh(cov)  # evals rosnąco
+    weights = None
+    if weight_map is not None:
+        if len(weight_map.shape) == 3:
+            wmap = cv2.cvtColor(weight_map, cv2.COLOR_BGR2GRAY)
+        else:
+            wmap = weight_map
+        w = wmap[pts[:, 0], pts[:, 1]].astype(np.float32)
+        if w.max() > 1.0:
+            w = w / 255.0
+        w = np.clip(w, 0.0, 1.0)
+        if float(np.sum(w)) > 1e-6:
+            weights = w
+
+    if weights is None:
+        mean = xy.mean(axis=0)
+        X = xy - mean
+        cov = (X.T @ X) / float(max(1, X.shape[0] - 1))
+    else:
+        wsum = float(np.sum(weights))
+        mean = (xy * weights[:, None]).sum(axis=0) / max(1e-6, wsum)
+        X = xy - mean
+        cov = (X.T * weights) @ X / max(1e-6, wsum)
+
+    evals, evecs = np.linalg.eigh(cov)  # evals asc
     order = np.argsort(evals)[::-1]
     evals = evals[order]
     evecs = evecs[:, order]
@@ -243,59 +363,66 @@ def estimate_from_mask_pca_tip(shadow_mask, min_pixels=300, tip_quantile=0.92, d
     main_axis = evecs[:, 0].astype(np.float32)
     main_axis = main_axis / (np.linalg.norm(main_axis) + 1e-6)
 
-    # Tip detection: punkty o największej projekcji na oś
     proj = (X @ main_axis).astype(np.float32)
-    thr = float(np.quantile(proj, float(tip_quantile)))
-    tip_pts = xy[proj >= thr]
+
+    gray_mu = 0.0
+    gray_conf = 0.0
+    if weights is not None:
+        wsum = float(np.sum(weights))
+        gray_mu = float(np.sum(weights * proj) / max(1e-6, wsum))
+        p_std = float(np.std(proj) + 1e-6)
+        gray_conf = float(np.clip(abs(gray_mu) / (2.0 * p_std), 0.0, 1.0))
+        if gray_mu < 0.0:
+            main_axis = -main_axis
+            proj = -proj
+
+    # Tip selection: far end opposite to the weighted (darker) side
+    q_far = 1.0 - float(tip_quantile)
+    if weights is not None:
+        thr = float(np.quantile(proj, q_far))
+        tip_pts = xy[proj <= thr]
+    else:
+        thr = float(np.quantile(proj, float(tip_quantile)))
+        tip_pts = xy[proj >= thr]
+
     if tip_pts.shape[0] < 10:
-        # fallback: max projection point
-        tip = xy[int(np.argmax(proj))]
+        tip = xy[int(np.argmin(proj))] if weights is not None else xy[int(np.argmax(proj))]
     else:
         tip = tip_pts.mean(axis=0)
 
-    # zwrot: od centroidu do tipa
-    dir_vec = (tip - mean).astype(np.float32)
+    dir_vec = (mean - tip).astype(np.float32)
     if float(np.linalg.norm(dir_vec)) < 1e-6:
-        dir_vec = main_axis
-    shadow_dir = _normalize2(dir_vec)
+        dir_vec = -main_axis
+    dir_vec = _normalize2(dir_vec)
 
-    # confidence: elongation via eigen ratio + size factor
     lam1 = float(max(evals[0], 1e-6))
     lam2 = float(max(evals[1], 1e-6))
     ratio = lam1 / lam2
-    # map ratio ~1..10+ do 0..1
     elong_conf = float(np.clip((ratio - 1.2) / 4.0, 0.0, 1.0))
     size_conf = float(np.clip((pts.shape[0] - min_pixels) / 5000.0, 0.0, 1.0))
-    conf = float(np.clip(0.2 + 0.6 * elong_conf + 0.2 * size_conf, 0.0, 1.0))
+    conf = float(np.clip(0.15 + 0.55 * elong_conf + 0.2 * size_conf + 0.1 * gray_conf, 0.0, 1.0))
 
     if not debug:
-        return shadow_dir, conf
+        return dir_vec, conf
 
     dbg = {
         'centroid_xy': (float(mean[0]), float(mean[1])),
         'tip_xy': (float(tip[0]), float(tip[1])),
         'axis_vec': (float(main_axis[0]), float(main_axis[1])),
-        'shadow_dir': (float(shadow_dir[0]), float(shadow_dir[1])),
+        'dir_vec': (float(dir_vec[0]), float(dir_vec[1])),
         'eigs': (float(lam1), float(lam2)),
         'eig_ratio': float(ratio),
         'n_pixels': int(pts.shape[0]),
         'elong_conf': float(elong_conf),
         'size_conf': float(size_conf),
+        'gray_mu': float(gray_mu),
+        'gray_conf': float(gray_conf),
     }
-    return shadow_dir, conf, dbg
+    return dir_vec, conf, dbg
 
 
 def is_object_visible_opposite_shadow(image_bgr, shadow_mask, shadow_dir_xy, sample_len=45, band_half=8, dark_drop=18, debug=False):
-    """Heurystyka: czy przy "nasadzie" cienia widać obiekt rzucający cień.
-
-    Pomysł:
-    - Bierzemy centroid maski jako przybliżenie środka cienia.
-    - Idziemy *przeciwnie* do kierunku cienia (czyli w stronę obiektu) o kilkadziesiąt px.
-    - Porównujemy luminancję w pobliżu tej pozycji z luminancją w tle wokół – jeśli jest wyraźny "ciemny" obiekt
-      lub silna krawędź, to zakładamy że obiekt jest widoczny.
-
-    Zwraca: visible(bool), confidence(0..1), dbg
-    """
+    """Heurystyka: czy przy nasadzie cienia widac obiekt rzucajacy cien."""
     if image_bgr is None or shadow_mask is None:
         return (False, 0.0, {'reason': 'missing'}) if debug else (False, 0.0)
 
@@ -369,16 +496,13 @@ def is_object_visible_opposite_shadow(image_bgr, shadow_mask, shadow_dir_xy, sam
     return bool(visible), float(conf), dbg
 
 
-def fuse_light_vectors(image_bgr, shadow_mask, prefer_mask=True, debug=False):
+def fuse_light_vectors(image_bgr, shadow_mask, shadow_score=None, prefer_mask=True, debug=False):
     """Łączy kilka estymatorów kierunku światła (2D) i zwraca finalny wektor + confidence.
 
     Składniki:
-    A) z maski: PCA+tip -> daje kierunek cienia; światło = -shadow_dir
+    A) z maski: PCA+tip -> kierunek od tip do centroidu (opcjonalnie z shadow_score)
     B) z obrazu: krawędzie cieni + Hough (estimate_light_direction_shadow_edges)
     C) fallback: gradient (estimate_light_direction_bgr)
-
-    Dodatkowo:
-    - heurystyka "czy obiekt widoczny" podbija zaufanie do zwrotu z maski
 
     Zwraca:
       angle_deg, vec_xy, confidence, dbg
@@ -391,13 +515,11 @@ def fuse_light_vectors(image_bgr, shadow_mask, prefer_mask=True, debug=False):
     ang_g, vec_g = estimate_light_direction_bgr(image_bgr)
     v_g = _normalize2(vec_g)
 
-    # A) mask PCA
+    # A) mask PCA (with optional gray weights)
     if shadow_mask is not None:
-        pca_out = estimate_from_mask_pca_tip(shadow_mask, debug=True)
-        shadow_dir, conf_m, dbg_m = pca_out
-        v_m = _normalize2(-np.array(shadow_dir, dtype=np.float32))  # światło przeciwnie do cienia
-        visible, conf_obj, dbg_obj = is_object_visible_opposite_shadow(image_bgr, shadow_mask, shadow_dir, debug=True)
-        # jeśli obiekt widoczny, podbij confidence maski
+        pca_out = estimate_from_mask_pca_tip(shadow_mask, weight_map=shadow_score, debug=True)
+        v_m, conf_m, dbg_m = pca_out
+        visible, conf_obj, dbg_obj = is_object_visible_opposite_shadow(image_bgr, shadow_mask, _normalize2(-np.array(v_m, dtype=np.float32)), debug=True)
         conf_m2 = float(np.clip(conf_m + 0.25 * conf_obj, 0.0, 1.0))
     else:
         v_m = None
@@ -407,57 +529,25 @@ def fuse_light_vectors(image_bgr, shadow_mask, prefer_mask=True, debug=False):
         conf_obj = 0.0
         dbg_obj = None
 
-    # wagi
+    # weights
     w_h = float(np.clip(conf_h, 0.0, 1.0))
     w_m = float(np.clip(conf_m2, 0.0, 1.0))
-    w_g = 0.15  # zawsze trochę stabilizacji
+    w_g = 0.15
 
     if prefer_mask:
         w_m *= 1.15
 
-    # jeśli hough mocny, a maska słaba -> zwiększ hough
     if w_h > 0.55 and w_m < 0.25:
         w_h *= 1.15
 
-    # sumowanie wektorów, ale uwaga na znak: jeśli v_m jest przeciwny do v_h, wybierz zgodny znak
-    vecs = []
-    wts = []
+    components = [
+        {'name': 'hough', 'vec': v_h, 'conf': w_h},
+        {'name': 'grad', 'vec': v_g, 'conf': w_g},
+    ]
+    if v_m is not None:
+        components.append({'name': 'mask', 'vec': v_m, 'conf': w_m})
 
-    def add_vec(v, w):
-        if v is None or w <= 1e-6:
-            return
-        vecs.append(_normalize2(v))
-        wts.append(float(w))
-
-    add_vec(v_h, w_h)
-    add_vec(v_g, w_g)
-    add_vec(v_m, w_m)
-
-    if not vecs:
-        v_final = np.array([1.0, 0.0], dtype=np.float32)
-        conf = 0.0
-    else:
-        # align signs to first vector
-        ref = vecs[0]
-        aligned = []
-        for v in vecs:
-            if float(np.dot(v, ref)) < 0:
-                aligned.append(-v)
-            else:
-                aligned.append(v)
-        V = np.vstack(aligned)
-        W = np.array(wts, dtype=np.float32).reshape(-1, 1)
-        v_final = _normalize2(np.sum(V * W, axis=0))
-
-        # spójność: średnia zgodność
-        dots = [float(np.dot(v_final, v)) for v in aligned]
-        agree = float(np.clip((np.mean(dots) + 1.0) / 2.0, 0.0, 1.0))
-
-        # confidence końcowe: waga * spójność
-        w_sum = float(np.sum(wts))
-        w_norm = float(np.clip(w_sum / 1.6, 0.0, 1.0))
-        conf = float(np.clip(agree * (0.25 + 0.75 * w_norm), 0.0, 1.0))
-
+    v_final, conf = merge_vectors(components)
     angle_deg = (np.degrees(np.arctan2(float(v_final[1]), float(v_final[0]))) + 360.0) % 360.0
 
     if not debug:
@@ -472,3 +562,4 @@ def fuse_light_vectors(image_bgr, shadow_mask, prefer_mask=True, debug=False):
         'weights': {'w_h': w_h, 'w_m': w_m, 'w_g': w_g},
     }
     return float(angle_deg), (float(v_final[0]), float(v_final[1])), float(conf), dbg
+

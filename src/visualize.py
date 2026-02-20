@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+
 def show(title, img, max_size=(1200, 800)):
     """Proste pokazanie obrazu w resizowalnym oknie (przydatne w PyCharm).
 
@@ -471,7 +472,8 @@ def build_main_view(image_bgr,
                     light_conf,
                     view_w,
                     view_h,
-                    compass_w):
+                    compass_w,
+                    ground_params=None):
     """Składa główny widok: porównanie + kompas.
 
     Zwraca: view_bgr
@@ -480,7 +482,8 @@ def build_main_view(image_bgr,
     if comp is None:
         return None
 
-    comp_fixed = letterbox_to_canvas(comp, view_w, view_h)
+    comp_w = int(max(120, int(view_w) - int(compass_w)))
+    comp_fixed = letterbox_to_canvas(comp, comp_w, view_h)
     if comp_fixed is None:
         return None
 
@@ -495,4 +498,3 @@ def build_main_view(image_bgr,
     top_row = cv2.hconcat([comp_fixed, compass])
 
     return top_row
-
