@@ -2,20 +2,47 @@ import cv2
 import numpy as np
 
 
-def _largest_connected_component(mask_u8):
-    """Zwraca maskę największej składowej (0/255)."""
-    if mask_u8 is None:
+def _to_gray_u8(mask, target_shape_hw=None):
+    if mask is None:
         return None
-
-    m = mask_u8
-    if len(m.shape) == 3:
-        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
-
+    if len(mask.shape) == 3:
+        m = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    else:
+        m = mask
+    if target_shape_hw is not None and m.shape[:2] != tuple(target_shape_hw):
+        m = cv2.resize(m, (int(target_shape_hw[1]), int(target_shape_hw[0])), interpolation=cv2.INTER_NEAREST)
     if m.dtype != np.uint8:
         mm = m.astype(np.float32)
         if mm.max() <= 1.0:
             mm *= 255.0
         m = np.clip(mm, 0, 255).astype(np.uint8)
+    return m
+
+
+def _extract_weight_values(weight_map, pts, target_shape_hw=None):
+    if weight_map is None:
+        return None
+    wm = weight_map
+    if len(wm.shape) == 3:
+        wm = cv2.cvtColor(wm, cv2.COLOR_BGR2GRAY)
+    if target_shape_hw is not None and wm.shape[:2] != tuple(target_shape_hw):
+        wm = cv2.resize(wm, (int(target_shape_hw[1]), int(target_shape_hw[0])), interpolation=cv2.INTER_LINEAR)
+    wm = wm.astype(np.float32)
+    if float(wm.max()) > 1.5:
+        wm = wm / 255.0
+    w = wm[pts[:, 0], pts[:, 1]].astype(np.float32)
+    w = np.clip(w, 0.0, 1.0)
+    if float(np.sum(w)) > 1e-6:
+        return w
+    return None
+
+
+def _largest_connected_component(mask_u8):
+    """Zwraca maskę największej składowej (0/255)."""
+    if mask_u8 is None:
+        return None
+
+    m = _to_gray_u8(mask_u8)
 
     if int(np.count_nonzero(m)) == 0:
         return np.zeros_like(m)
@@ -38,18 +65,18 @@ def _normalize2(v):
 
 
 def _pca_tip_from_mask_component(mask_u8, weight_map=None, min_pixels=300, tip_quantile=0.92, debug=False):
+    """Wyznacza kierunek z pojedynczej skladowej maski metoda PCA.
+
+    Kroki: liczy centroid punktow maski, os glowna PCA, wybiera czubek
+    (koniec maski po przeciwnej stronie do bardziej obciazonej wagami),
+    a kierunek zwraca jako wektor od czubka do centroidu.
+
+    Zwraca: (vec_xy, confidence) lub (vec_xy, confidence, dbg) gdy debug=True.
+    """
     if mask_u8 is None:
         raise ValueError('Pusta maska')
 
-    m = mask_u8
-    if len(m.shape) == 3:
-        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
-
-    if m.dtype != np.uint8:
-        mm = m.astype(np.float32)
-        if mm.max() <= 1.0:
-            mm = mm * 255.0
-        m = np.clip(mm, 0, 255).astype(np.uint8)
+    m = _to_gray_u8(mask_u8)
 
     pts = np.column_stack(np.where(m > 0))
     if pts.shape[0] < int(min_pixels):
@@ -58,18 +85,7 @@ def _pca_tip_from_mask_component(mask_u8, weight_map=None, min_pixels=300, tip_q
 
     xy = pts[:, ::-1].astype(np.float32)  # (x,y)
 
-    weights = None
-    if weight_map is not None:
-        if len(weight_map.shape) == 3:
-            wmap = cv2.cvtColor(weight_map, cv2.COLOR_BGR2GRAY)
-        else:
-            wmap = weight_map
-        w = wmap[pts[:, 0], pts[:, 1]].astype(np.float32)
-        if w.max() > 1.0:
-            w = w / 255.0
-        w = np.clip(w, 0.0, 1.0)
-        if float(np.sum(w)) > 1e-6:
-            weights = w
+    weights = _extract_weight_values(weight_map, pts, target_shape_hw=m.shape[:2])
 
     if weights is None:
         mean = xy.mean(axis=0)
@@ -81,7 +97,7 @@ def _pca_tip_from_mask_component(mask_u8, weight_map=None, min_pixels=300, tip_q
         X = xy - mean
         cov = (X.T * weights) @ X / max(1e-6, wsum)
 
-    evals, evecs = np.linalg.eigh(cov)  # evals asc
+    evals, evecs = np.linalg.eigh(cov)  # wartosci w kolejnosci rosnacej
     order = np.argsort(evals)[::-1]
     evals = evals[order]
     evecs = evecs[:, order]
@@ -102,7 +118,7 @@ def _pca_tip_from_mask_component(mask_u8, weight_map=None, min_pixels=300, tip_q
             main_axis = -main_axis
             proj = -proj
 
-    # Tip selection: far end opposite to the weighted (darker) side
+    # wybor czubka: koniec przeciwny do strony bardziej obciazonej wagami (ciemniejszej)
     q_far = 1.0 - float(tip_quantile)
     if weights is not None:
         thr = float(np.quantile(proj, q_far))
@@ -335,10 +351,10 @@ def estimate_light_direction_shadow_edge_gradient(
         hp_blur_ksize=51,
         debug=False,
 ):
-    """Kierunek z gradientu luminancji liczony tylko na krawędzi cienia.
+    """Kierunek z gradientu luminancji liczony tylko na krawedzi cienia.
 
-    To zwykle stabilniejsze niż globalny gradient, bo ograniczamy się do miejsca,
-    gdzie cień faktycznie zmienia jasność.
+    To zwykle stabilniejsze niz globalny gradient, bo ograniczamy sie do miejsca,
+    gdzie cien faktycznie zmienia jasnosc.
 
     Zwraca: (angle_deg, vec_xy, confidence) lub +dbg gdy debug=True.
     """
@@ -346,20 +362,13 @@ def estimate_light_direction_shadow_edge_gradient(
         out = (0.0, (1.0, 0.0), 0.0)
         return (*out, {'reason': 'missing'}) if debug else out
 
-    m = shadow_mask
-    if len(m.shape) == 3:
-        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
-    if m.dtype != np.uint8:
-        mm = m.astype(np.float32)
-        if mm.max() <= 1.0:
-            mm *= 255.0
-        m = np.clip(mm, 0, 255).astype(np.uint8)
+    m = _to_gray_u8(shadow_mask)
 
     if int(np.count_nonzero(m)) < 50:
         out = (0.0, (1.0, 0.0), 0.0)
         return (*out, {'reason': 'too_few_mask_pixels'}) if debug else out
 
-    # Inner-ring: wąski pas *wewnątrz* cienia (zmniejsza wpływ tekstury jasnej strony).
+    # pierscien wewnetrzny: waski pas wewnatrz cienia (mniejszy wplyw faktury jasnej strony)
     k = int(max(1, edge_ring))
     k = min(k, 9)
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
@@ -391,14 +400,14 @@ def estimate_light_direction_shadow_edge_gradient(
     gys = gy[ys, xs]
     mag = np.sqrt(gxs * gxs + gys * gys) + 1e-6
 
-    # Odrzucenie slabego gradientu (najczesciej faktura / szum).
+    # Odrzucenie slabego gradientu (najczesciej faktura lub szum).
     mp = float(np.clip(float(mag_percentile), 0.0, 99.0))
     thr = float(np.percentile(mag, mp))
     keep = mag >= max(1e-6, thr)
     if int(np.count_nonzero(keep)) < 20:
         keep = mag >= max(1e-6, float(np.percentile(mag, 60.0)))
 
-    # wagi: siła gradientu * opcjonalna waga z mapy (np. shadow_score 0..1)
+    # wagi: sila gradientu * opcjonalna waga z mapy (np. shadow_score 0..1)
     w = mag.copy()
     if weight_map is not None:
         wm = weight_map
@@ -411,7 +420,7 @@ def estimate_light_direction_shadow_edge_gradient(
             wm = wm / 255.0
         w = w * np.clip(wm[ys, xs], 0.0, 1.0)
 
-    # zastosuj keep
+    # zastosuj filtr keep
     w = w[keep]
     vx = (gxs / mag)[keep]
     vy = (gys / mag)[keep]
@@ -428,9 +437,9 @@ def estimate_light_direction_shadow_edge_gradient(
 
     ang = (np.degrees(np.arctan2(v_out[1], v_out[0])) + 360.0) % 360.0
 
-    # confidence = spójność kierunków na krawędzi
+    # confidence = spójność kierunków na krawedzi
     conf = float(np.clip(norm / (float(np.sum(w)) + 1e-6), 0.0, 1.0))
-    # penalizuj, gdy zostalo malo punktow (mniej wiarygodne)
+    # obniz, gdy zostalo malo punktow (mniej wiarygodne)
     size_boost = float(np.clip((float(vx.size) - 50.0) / 500.0, 0.0, 1.0))
     conf = float(np.clip(0.15 + 0.85 * conf, 0.0, 1.0))
     conf = float(np.clip(conf * (0.6 + 0.4 * size_boost), 0.0, 1.0))
@@ -458,16 +467,7 @@ def estimate_from_mask_pca_tip(shadow_mask, weight_map=None, min_pixels=300, tip
     if shadow_mask is None:
         raise ValueError('Pusta maska')
 
-    if len(shadow_mask.shape) == 3:
-        m = cv2.cvtColor(shadow_mask, cv2.COLOR_BGR2GRAY)
-    else:
-        m = shadow_mask
-
-    if m.dtype != np.uint8:
-        mm = m.astype(np.float32)
-        if mm.max() <= 1.0:
-            mm = mm * 255.0
-        m = np.clip(mm, 0, 255).astype(np.uint8)
+    m = _to_gray_u8(shadow_mask)
 
     num, labels, stats, _ = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8), connectivity=8)
     if num <= 1:
@@ -531,10 +531,7 @@ def is_object_visible_opposite_shadow(image_bgr, shadow_mask, shadow_dir_xy, sam
     if image_bgr is None or shadow_mask is None:
         return (False, 0.0, {'reason': 'missing'}) if debug else (False, 0.0)
 
-    if len(shadow_mask.shape) == 3:
-        m = cv2.cvtColor(shadow_mask, cv2.COLOR_BGR2GRAY)
-    else:
-        m = shadow_mask
+    m = _to_gray_u8(shadow_mask)
 
     ys, xs = np.where(m > 0)
     if ys.size < 200:
@@ -602,25 +599,25 @@ def is_object_visible_opposite_shadow(image_bgr, shadow_mask, shadow_dir_xy, sam
 
 
 def fuse_light_vectors(image_bgr, shadow_mask, shadow_score=None, prefer_mask=True, debug=False):
-    """Łączy kilka estymatorów kierunku światła (2D) i zwraca finalny wektor + confidence.
+    """Laczy estymatory kierunku swiatla (2D) i zwraca finalny wektor + confidence.
 
-    Składniki:
+    Skladniki:
     A) z maski: PCA+tip -> kierunek od tip do centroidu (opcjonalnie z shadow_score)
-    B) z obrazu: krawędzie cieni + Hough (estimate_light_direction_shadow_edges)
+    B) z obrazu: krawedzie cieni + Hough (estimate_light_direction_shadow_edges)
     C) fallback: gradient (estimate_light_direction_bgr)
 
     Zwraca:
       angle_deg, vec_xy, confidence, dbg
     """
-    # B) Hough on shadow-like edges
+    # B) Hough na krawedziach cienia
     ang_h, vec_h, conf_h = estimate_light_direction_shadow_edges(image_bgr)
     v_h = _normalize2(vec_h)
 
-    # C) gradient fallback
+    # C) fallback z gradientu
     ang_g, vec_g = estimate_light_direction_bgr(image_bgr)
     v_g = _normalize2(vec_g)
 
-    # A) mask PCA (with optional gray weights)
+    # A) maska: PCA (opcjonalnie z wagami szarosci)
     if shadow_mask is not None:
         pca_out = estimate_from_mask_pca_tip(shadow_mask, weight_map=shadow_score, debug=True)
         v_m, conf_m, dbg_m = pca_out
@@ -634,7 +631,7 @@ def fuse_light_vectors(image_bgr, shadow_mask, shadow_score=None, prefer_mask=Tr
         conf_obj = 0.0
         dbg_obj = None
 
-    # weights
+    # wagi skladnikow
     w_h = float(np.clip(conf_h, 0.0, 1.0))
     w_m = float(np.clip(conf_m2, 0.0, 1.0))
     w_g = 0.15

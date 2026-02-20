@@ -46,9 +46,7 @@ def show_comparison(title, image, mask, overlay=True, scale=1.0, max_size=(1200,
     if mask is None:
         raise ValueError("Pusta maska")
 
-    # Upewnij się, że maska jest jednokanałowa i ma zakres 0..255
     if len(mask.shape) == 3:
-        # jeśli maska ma 3 kanały, skonwertuj do szarości
         mask_gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     else:
         mask_gray = mask
@@ -100,7 +98,7 @@ def show_comparison(title, image, mask, overlay=True, scale=1.0, max_size=(1200,
         right_r = cv2.resize(right, (int(right.shape[1] * h / right.shape[0]), h))
         comparison = cv2.hconcat([left_r, right_r])
 
-    # Pokaz w resizowalnym oknie - przydatne np. w PyCharm
+    # Podglad w oknie z mozliwoscia zmiany rozmiaru (np. w PyCharm)
     cv2.namedWindow(title, cv2.WINDOW_NORMAL)
     ch, cw = comparison.shape[:2]
     cap_w, cap_h = max_size
@@ -117,12 +115,11 @@ def show_comparison(title, image, mask, overlay=True, scale=1.0, max_size=(1200,
 
 
 def build_comparison(image, mask, overlay=True):
-    """Zwraca obraz porównania (left=image, right=overlay mask) bez wywoływania waitKey.
-    """
+    """Zwraca obraz porównania (left=image, right=overlay mask) bez wywoływania waitKey."""
     if image is None or mask is None:
         return None
 
-    # ensure single-channel mask
+    # Maskę do 1 kanalu i zakresu 0..255
     if len(mask.shape) == 3:
         mask_gray = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
     else:
@@ -172,7 +169,7 @@ def draw_light_vector(img_bgr, angle_deg, vec_xy=None, origin=None, length=None,
     """Rysuje strzałkę pokazującą kierunek światła w 2D.
 
     Uwaga: z pojedynczego obrazu nie da się wiarygodnie wyznaczyć pełnego wektora 3D (bez geometrii/sceny).
-    To jest *kierunek na płaszczyźnie obrazu* (2D), który zwykle koreluje z kierunkiem oświetlenia/cieni.
+    To jest kierunek na płaszczyźnie obrazu (2D), który zwykle koreluje z kierunkiem oświetlenia i cieni.
 
     - angle_deg: kąt 0..360 (0=→, 90=↓)
     - vec_xy: opcjonalny (vx, vy); jeśli podasz, angle_deg użyty tylko do opisu
@@ -207,9 +204,9 @@ def draw_light_vector(img_bgr, angle_deg, vec_xy=None, origin=None, length=None,
     ex = int(ox + vx * length)
     ey = int(oy + vy * length)
 
-    # arrow
+    # strzalka
     cv2.arrowedLine(out, (ox, oy), (ex, ey), color, 2, tipLength=0.25)
-    # origin dot
+    # punkt bazowy
     cv2.circle(out, (ox, oy), 4, color, -1)
 
     draw_text_box(out, f"Light dir: {angle_deg:.1f} deg", org=(ox, max(25, oy - 10)), font_scale=0.55, color=(255, 255, 255), bg_color=(0, 0, 0))
@@ -226,12 +223,220 @@ def _as_gray_mask(mask, target_shape_hw=None):
     if target_shape_hw is not None and m.shape[:2] != tuple(target_shape_hw):
         m = cv2.resize(m, (int(target_shape_hw[1]), int(target_shape_hw[0])), interpolation=cv2.INTER_NEAREST)
     if m.dtype != np.uint8:
-        # najczęstszy przypadek: maska 0/1 lub bool
+        # najczestszy przypadek: maska 0/1 lub bool
         m = (m.astype(np.float32))
         if m.max() <= 1.0:
             m = (m * 255.0)
         m = np.clip(m, 0, 255).astype(np.uint8)
     return m
+
+
+
+
+def draw_confidence_badge(img_bgr, confidence, text=None, org=(10, 30)):
+    """Mały znacznik z confidence w rogu."""
+    if img_bgr is None:
+        return img_bgr
+    conf = float(confidence) if confidence is not None else 0.0
+    conf = float(np.clip(conf, 0.0, 1.0))
+
+    if text is None:
+        text = f"conf={conf:.2f}"
+
+    # kolor od czerwonego do zielonego
+    r = int(round(255 * (1.0 - conf)))
+    g = int(round(255 * conf))
+    col = (0, g, r)
+
+    x, y = int(org[0]), int(org[1])
+    pad = 6
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    fs = 0.65
+    (tw, th), bl = cv2.getTextSize(text, font, fs, 2)
+    cv2.rectangle(img_bgr, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), (0, 0, 0), -1)
+    cv2.rectangle(img_bgr, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), col, 2)
+    cv2.putText(img_bgr, text, (x, y), font, fs, (255, 255, 255), 2, cv2.LINE_AA)
+    return img_bgr
+
+
+def build_light_direction_debug_view(image_bgr, shadow_mask, fuse_dbg, overlay_alpha=0.35):
+    """Buduje pojedynczy obraz podglądowy z nałożeniami (do oceny ręcznej).
+
+    fuse_dbg: wynik debug z fuse_light_vectors(..., debug=True)
+    """
+    if image_bgr is None:
+        return None
+
+    out = image_bgr.copy()
+    if shadow_mask is not None:
+        out = overlay_mask_red(out, shadow_mask, alpha=overlay_alpha)
+
+    # os PCA + tip
+    try:
+        m = (fuse_dbg or {}).get('mask')
+        if m and m.get('dbg'):
+            dbg_m = m['dbg']
+            out = draw_pca_axis_and_tip(out, dbg_m.get('centroid_xy'), dbg_m.get('axis_vec'), dbg_m.get('tip_xy'))
+    except Exception:
+        pass
+
+    # wektor koncowy + confidence
+    try:
+        v_final = (fuse_dbg or {}).get('v_final')
+        conf_final = (fuse_dbg or {}).get('conf_final', 0.0)
+        if v_final is not None:
+            out = draw_vector_arrow(out, v_final, color=(0, 255, 0))
+        draw_confidence_badge(out, conf_final, text=f"final conf={float(conf_final):.2f}", org=(10, 30))
+    except Exception:
+        pass
+
+    # adnotacje confidence skladowych
+    try:
+        h = (fuse_dbg or {}).get('hough', {})
+        mh = float(h.get('conf', 0.0))
+        m = (fuse_dbg or {}).get('mask')
+        mm = float(m.get('conf', 0.0)) if m else 0.0
+        txt = f"Hough={mh:.2f}  Mask={mm:.2f}"
+        cv2.putText(out, txt, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, txt, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+    except Exception:
+        pass
+
+    return out
+
+
+def letterbox_to_canvas(img_bgr, canvas_w, canvas_h, bg=(10, 10, 10), inner_margin=12, draw_frame=True):
+    """Skaluje obraz do stałej ramki (canvas) z zachowaniem proporcji i paddingiem."""
+    if img_bgr is None:
+        return None
+    ch, cw = img_bgr.shape[:2]
+    if ch <= 0 or cw <= 0:
+        return None
+
+    canvas_w = int(canvas_w)
+    canvas_h = int(canvas_h)
+    inner_margin = int(max(0, inner_margin))
+
+    avail_w = max(1, canvas_w - 2 * inner_margin)
+    avail_h = max(1, canvas_h - 2 * inner_margin)
+
+    s = min(float(avail_w) / float(cw), float(avail_h) / float(ch))
+    s = max(1e-6, s)
+    nw = max(1, int(round(cw * s)))
+    nh = max(1, int(round(ch * s)))
+
+    interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(img_bgr, (nw, nh), interpolation=interp)
+
+    canvas = np.full((canvas_h, canvas_w, 3), bg, dtype=np.uint8)
+    x0 = (canvas_w - nw) // 2
+    y0 = (canvas_h - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+
+    if draw_frame:
+        cv2.rectangle(canvas, (0, 0), (canvas_w - 1, canvas_h - 1), (60, 60, 60), 1)
+        cv2.rectangle(canvas, (x0, y0), (x0 + nw - 1, y0 + nh - 1), (90, 90, 90), 1)
+
+    return canvas
+
+
+def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, mean_conf=None, w=170, h=300, title='LIGHT'):
+    """Mały kompas pokazujący kierunek światła strzałką."""
+    w = int(max(96, w))
+    h = int(max(96, h))
+    canvas = np.full((h, w, 3), (14, 14, 14), dtype=np.uint8)
+
+    cx, cy = w // 2, h // 2
+    r = int(0.38 * min(w, h))
+
+    if title:
+        cv2.putText(canvas, str(title), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
+
+    cv2.circle(canvas, (cx, cy), r, (90, 90, 90), 1, cv2.LINE_AA)
+    cv2.circle(canvas, (cx, cy), 2, (200, 200, 200), -1)
+
+    def put(lbl, px, py):
+        cv2.putText(canvas, lbl, (px, py), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+
+    put('N', cx - 6, cy - r - 10)
+    put('S', cx - 6, cy + r + 18)
+    put('W', cx - r - 22, cy + 6)
+    put('E', cx + r + 10, cy + 6)
+
+    is_known = vec_xy is not None and angle_deg is not None and confidence is not None
+    if is_known:
+        vx, vy = float(vec_xy[0]), float(vec_xy[1])
+        n = (vx * vx + vy * vy) ** 0.5 + 1e-6
+        vx /= n
+        vy /= n
+        conf = float(np.clip(float(confidence), 0.0, 1.0))
+        length = int(round((r - 6) * (0.35 + 0.65 * conf)))
+        ex = int(round(cx + vx * length))
+        ey = int(round(cy + vy * length))
+        cv2.arrowedLine(canvas, (cx, cy), (ex, ey), (0, 255, 0), 2, tipLength=0.22)
+
+        conf = float(np.clip(float(confidence), 0.0, 1.0))
+        ang = float(angle_deg) % 360.0
+        cv2.putText(canvas, f"Angle {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Confidence {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(canvas, "Angle unknown", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Confidence unknown", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+
+    if mean_conf is not None:
+        mc = float(np.clip(float(mean_conf), 0.0, 1.0))
+        cv2.putText(canvas, f"Mean conf {mc:.2f}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(canvas, "Mean conf unknown", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+
+    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (60, 60, 60), 1)
+    return canvas
+
+
+
+def build_main_view(image_bgr,
+                    shadow_mask,
+                    overlay,
+                    show_direction,
+                    light_vec,
+                    light_ang,
+                    light_conf,
+                    mean_conf,
+                    view_w,
+                    view_h,
+                    compass_w,
+                    ground_params=None):
+    """Składa główny widok: porównanie i kompas.
+
+    Zwraca: view_bgr.
+    """
+    comp = build_comparison(image_bgr, shadow_mask, overlay=overlay)
+    if comp is None:
+        return None
+
+    comp_w = int(max(120, int(view_w) - int(compass_w)))
+    comp_fixed = letterbox_to_canvas(comp, comp_w, view_h)
+    if comp_fixed is None:
+        return None
+
+    compass = render_compass_widget(light_vec if show_direction else None,
+                                   angle_deg=light_ang if show_direction else 0.0,
+                                   confidence=light_conf if show_direction else 0.0,
+                                   mean_conf=mean_conf if show_direction else None,
+                                   w=compass_w,
+                                   h=view_h)
+    if not show_direction:
+        cv2.putText(compass, 'DIR OFF', (20, view_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
+
+    top_row = cv2.hconcat([comp_fixed, compass])
+
+    return top_row
+
+
+
+
+
+
 
 
 def draw_pca_axis_and_tip(img_bgr, centroid_xy, axis_vec_xy, tip_xy=None, color=(255, 200, 0)):
@@ -314,203 +519,3 @@ def draw_vector_arrow(img_bgr, vec_xy, origin=None, length=None, color=(0, 255, 
     cv2.arrowedLine(out, (ox, oy), (ex, ey), color, int(thickness), tipLength=0.25)
     cv2.circle(out, (ox, oy), 4, color, -1)
     return out
-
-
-def draw_confidence_badge(img_bgr, confidence, text=None, org=(10, 30)):
-    """Mały 'badge' z confidence w rogu."""
-    if img_bgr is None:
-        return img_bgr
-    conf = float(confidence) if confidence is not None else 0.0
-    conf = float(np.clip(conf, 0.0, 1.0))
-
-    if text is None:
-        text = f"conf={conf:.2f}"
-
-    # kolor od czerwonego do zielonego
-    r = int(round(255 * (1.0 - conf)))
-    g = int(round(255 * conf))
-    col = (0, g, r)
-
-    x, y = int(org[0]), int(org[1])
-    pad = 6
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    fs = 0.65
-    (tw, th), bl = cv2.getTextSize(text, font, fs, 2)
-    cv2.rectangle(img_bgr, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), (0, 0, 0), -1)
-    cv2.rectangle(img_bgr, (x - pad, y - th - pad), (x + tw + pad, y + bl + pad), col, 2)
-    cv2.putText(img_bgr, text, (x, y), font, fs, (255, 255, 255), 2, cv2.LINE_AA)
-    return img_bgr
-
-
-def build_light_direction_debug_view(image_bgr, shadow_mask, fuse_dbg, overlay_alpha=0.35):
-    """Buduje pojedynczy obraz podglądowy z nałożeniami (do oceny ręcznej).
-
-    fuse_dbg: wynik debug z fuse_light_vectors(..., debug=True)
-    """
-    if image_bgr is None:
-        return None
-
-    out = image_bgr.copy()
-    if shadow_mask is not None:
-        out = overlay_mask_red(out, shadow_mask, alpha=overlay_alpha)
-
-    # PCA axis + tip
-    try:
-        m = (fuse_dbg or {}).get('mask')
-        if m and m.get('dbg'):
-            dbg_m = m['dbg']
-            out = draw_pca_axis_and_tip(out, dbg_m.get('centroid_xy'), dbg_m.get('axis_vec'), dbg_m.get('tip_xy'))
-    except Exception:
-        pass
-
-    # final vector + confidence
-    try:
-        v_final = (fuse_dbg or {}).get('v_final')
-        conf_final = (fuse_dbg or {}).get('conf_final', 0.0)
-        if v_final is not None:
-            out = draw_vector_arrow(out, v_final, color=(0, 255, 0))
-        draw_confidence_badge(out, conf_final, text=f"final conf={float(conf_final):.2f}", org=(10, 30))
-    except Exception:
-        pass
-
-    # annotate components confidence
-    try:
-        h = (fuse_dbg or {}).get('hough', {})
-        mh = float(h.get('conf', 0.0))
-        m = (fuse_dbg or {}).get('mask')
-        mm = float(m.get('conf', 0.0)) if m else 0.0
-        txt = f"Hough={mh:.2f}  Mask={mm:.2f}"
-        cv2.putText(out, txt, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(out, txt, (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
-    except Exception:
-        pass
-
-    return out
-
-
-def letterbox_to_canvas(img_bgr, canvas_w, canvas_h, bg=(10, 10, 10), inner_margin=12, draw_frame=True):
-    """Skaluje obraz do stałej ramki (canvas) z zachowaniem proporcji i paddingiem."""
-    if img_bgr is None:
-        return None
-    ch, cw = img_bgr.shape[:2]
-    if ch <= 0 or cw <= 0:
-        return None
-
-    canvas_w = int(canvas_w)
-    canvas_h = int(canvas_h)
-    inner_margin = int(max(0, inner_margin))
-
-    avail_w = max(1, canvas_w - 2 * inner_margin)
-    avail_h = max(1, canvas_h - 2 * inner_margin)
-
-    s = min(float(avail_w) / float(cw), float(avail_h) / float(ch))
-    s = max(1e-6, s)
-    nw = max(1, int(round(cw * s)))
-    nh = max(1, int(round(ch * s)))
-
-    interp = cv2.INTER_AREA if s < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(img_bgr, (nw, nh), interpolation=interp)
-
-    canvas = np.full((canvas_h, canvas_w, 3), bg, dtype=np.uint8)
-    x0 = (canvas_w - nw) // 2
-    y0 = (canvas_h - nh) // 2
-    canvas[y0:y0 + nh, x0:x0 + nw] = resized
-
-    if draw_frame:
-        cv2.rectangle(canvas, (0, 0), (canvas_w - 1, canvas_h - 1), (60, 60, 60), 1)
-        cv2.rectangle(canvas, (x0, y0), (x0 + nw - 1, y0 + nh - 1), (90, 90, 90), 1)
-
-    return canvas
-
-
-def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, mean_conf=None, w=170, h=300, title='LIGHT'):
-    """Mały 'kompas' pokazujący kierunek światła strzałką."""
-    w = int(max(96, w))
-    h = int(max(96, h))
-    canvas = np.full((h, w, 3), (14, 14, 14), dtype=np.uint8)
-
-    cx, cy = w // 2, h // 2
-    r = int(0.38 * min(w, h))
-
-    if title:
-        cv2.putText(canvas, str(title), (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (210, 210, 210), 1, cv2.LINE_AA)
-
-    cv2.circle(canvas, (cx, cy), r, (90, 90, 90), 1, cv2.LINE_AA)
-    cv2.circle(canvas, (cx, cy), 2, (200, 200, 200), -1)
-
-    def put(lbl, px, py):
-        cv2.putText(canvas, lbl, (px, py), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-
-    put('N', cx - 6, cy - r - 10)
-    put('S', cx - 6, cy + r + 18)
-    put('W', cx - r - 22, cy + 6)
-    put('E', cx + r + 10, cy + 6)
-
-    is_known = vec_xy is not None and angle_deg is not None and confidence is not None
-    if is_known:
-        vx, vy = float(vec_xy[0]), float(vec_xy[1])
-        n = (vx * vx + vy * vy) ** 0.5 + 1e-6
-        vx /= n
-        vy /= n
-        conf = float(np.clip(float(confidence), 0.0, 1.0))
-        length = int(round((r - 6) * (0.35 + 0.65 * conf)))
-        ex = int(round(cx + vx * length))
-        ey = int(round(cy + vy * length))
-        cv2.arrowedLine(canvas, (cx, cy), (ex, ey), (0, 255, 0), 2, tipLength=0.22)
-
-        conf = float(np.clip(float(confidence), 0.0, 1.0))
-        ang = float(angle_deg) % 360.0
-        cv2.putText(canvas, f"Angle {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, f"Confidence {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-    else:
-        cv2.putText(canvas, "Angle unknown", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-        cv2.putText(canvas, "Confidence unknown", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-
-    if mean_conf is not None:
-        mc = float(np.clip(float(mean_conf), 0.0, 1.0))
-        cv2.putText(canvas, f"Mean conf {mc:.2f}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
-    else:
-        cv2.putText(canvas, "Mean conf unknown", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
-
-    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (60, 60, 60), 1)
-    return canvas
-
-
-
-def build_main_view(image_bgr,
-                    shadow_mask,
-                    overlay,
-                    show_direction,
-                    light_vec,
-                    light_ang,
-                    light_conf,
-                    mean_conf,
-                    view_w,
-                    view_h,
-                    compass_w,
-                    ground_params=None):
-    """Składa główny widok: porównanie + kompas.
-
-    Zwraca: view_bgr
-    """
-    comp = build_comparison(image_bgr, shadow_mask, overlay=overlay)
-    if comp is None:
-        return None
-
-    comp_w = int(max(120, int(view_w) - int(compass_w)))
-    comp_fixed = letterbox_to_canvas(comp, comp_w, view_h)
-    if comp_fixed is None:
-        return None
-
-    compass = render_compass_widget(light_vec if show_direction else None,
-                                   angle_deg=light_ang if show_direction else 0.0,
-                                   confidence=light_conf if show_direction else 0.0,
-                                   mean_conf=mean_conf if show_direction else None,
-                                   w=compass_w,
-                                   h=view_h)
-    if not show_direction:
-        cv2.putText(compass, 'DIR OFF', (20, view_h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
-
-    top_row = cv2.hconcat([comp_fixed, compass])
-
-    return top_row

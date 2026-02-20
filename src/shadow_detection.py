@@ -54,7 +54,10 @@ def _dominant_line_angle_deg(edge_img, min_line_length=40, max_line_gap=10, houg
 
 
 def _compute_ratio_mask(v8, blur_sizes=(15, 31, 61), ratio_thresholds=(0.75, 0.70, 0.65)):
-    """Multi-scale V / blur(V) ratio mask. Returns (mask, ratio_maps, ratio_min)."""
+    """Maska na podstawie wieloskalowego V/blur(V).
+
+    Zwraca: (mask, ratio_maps, ratio_min).
+    """
     ratio_maps = []
     masks = []
     v = v8.astype(np.float32) + 1e-6
@@ -81,64 +84,33 @@ def _compute_ratio_mask(v8, blur_sizes=(15, 31, 61), ratio_thresholds=(0.75, 0.7
     return ratio_mask, ratio_maps, ratio_min
 
 
-def detect_shadow_physics(
-        image_bgr,
-        v_thresh=75,
-        hue_window=31,
-        hue_diff_max=10,
-        min_area=200,
-        min_elongation=1.3,
-        morph_kernel=5,
-        # local contrast (luminance) enhancement
-        use_clahe=True,
-        clahe_clip_limit=2.0,
-        clahe_tile_grid_size=(8, 8),
-        # ratio thresholds (multi-scale V/blur(V))
-        ratio_blur_sizes=(15, 31, 61),
-        ratio_thresholds=(0.75, 0.70, 0.65),
-        # soft grayscale shadow score
-        use_soft_shadow=True,
-        soft_shadow_thresh=0.20,
-        soft_shadow_scale=0.40,
-        # geometry validation (binary filter)
-        use_geometry_validation=True,
-        min_line_conf=0.35,
-        debug=False,
+def _apply_clahe(v, clahe_clip_limit, clahe_tile_grid_size):
+    try:
+        tg = (int(clahe_tile_grid_size[0]), int(clahe_tile_grid_size[1]))
+        tg = (max(2, tg[0]), max(2, tg[1]))
+    except Exception:
+        tg = (8, 8)
+    clip = float(clahe_clip_limit) if clahe_clip_limit is not None else 2.0
+    clip = max(0.5, min(10.0, clip))
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tg)
+    return clahe.apply(v)
+
+
+def _compute_base_shadow_mask(
+    v8,
+    v_thresh,
+    ratio_blur_sizes,
+    ratio_thresholds,
+    use_soft_shadow,
+    soft_shadow_thresh,
+    soft_shadow_scale,
 ):
-    """Detekcja cieni na podstawie luminancji i spojnosc koloru.
-
-    Zwraca maskę 0/255; gdy debug=True zwraca (mask, dbg_dict).
-    """
-    if image_bgr is None:
-        raise ValueError('Pusty obraz')
-
-    img = cv2.GaussianBlur(image_bgr, (5, 5), 0)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-
-    # CLAHE na luminancji (V) — podbija lokalny kontrast bez zmiany H/S.
-    if use_clahe:
-        # lokalny kontrast tylko na V
-        try:
-            tg = (int(clahe_tile_grid_size[0]), int(clahe_tile_grid_size[1]))
-            tg = (max(2, tg[0]), max(2, tg[1]))
-        except Exception:
-            tg = (8, 8)
-        clip = float(clahe_clip_limit) if clahe_clip_limit is not None else 2.0
-        clip = max(0.5, min(10.0, clip))
-        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=tg)
-        v = clahe.apply(v)
-
-    v8 = v
-
-    # kandydaci cienia: V i V/blur(V)
     v_mask = (v8 < int(v_thresh)).astype(np.uint8) * 255
     ratio_mask, ratio_maps, ratio_min = _compute_ratio_mask(v8, ratio_blur_sizes, ratio_thresholds)
 
     soft_mask = None
     shadow_score = None
     if use_soft_shadow and ratio_min is not None:
-        # shadow_score 0..1, higher = darker relative to local background
         shadow_score = np.clip((1.0 - ratio_min) / float(max(1e-3, soft_shadow_scale)), 0.0, 1.0)
         soft_mask = (shadow_score >= float(soft_shadow_thresh)).astype(np.uint8) * 255
         base_mask = cv2.bitwise_or(v_mask, ratio_mask)
@@ -146,7 +118,10 @@ def detect_shadow_physics(
     else:
         base_mask = cv2.bitwise_or(v_mask, ratio_mask)
 
-    # spojnosc barwy (H) wzgledem lokalnej sredniej
+    return base_mask, v_mask, ratio_mask, ratio_maps, ratio_min, soft_mask, shadow_score
+
+
+def _compute_hue_mask(h, hue_window, hue_diff_max):
     k = int(max(3, hue_window))
     if k % 2 == 0:
         k += 1
@@ -162,18 +137,28 @@ def detect_shadow_physics(
 
     hue_diff = _circular_hue_diff(h, mean_h)
     hue_ok = (hue_diff <= int(hue_diff_max)).astype(np.uint8) * 255
+    return hue_ok
 
-    cand = cv2.bitwise_and(base_mask, hue_ok)
 
-    # morfologia
+def _apply_morphology(mask_u8, morph_kernel):
     mk = int(max(3, morph_kernel))
     if mk % 2 == 0:
         mk += 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mk, mk))
-    cand = cv2.morphologyEx(cand, cv2.MORPH_CLOSE, kernel)
-    cand = cv2.morphologyEx(cand, cv2.MORPH_OPEN, kernel)
+    out = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
+    out = cv2.morphologyEx(out, cv2.MORPH_OPEN, kernel)
+    return out
 
-    # komponenty + elongation
+
+def _filter_components(
+    cand,
+    v8,
+    min_area,
+    min_elongation,
+    use_geometry_validation,
+    min_line_conf,
+    debug,
+):
     num, labels, stats, _ = cv2.connectedComponentsWithStats(cand, connectivity=8)
     out = np.zeros_like(cand)
     dbg_regions = []
@@ -199,9 +184,7 @@ def detect_shadow_physics(
         line_conf = 0.0
         line_weight = 1.0
 
-        # 7) geometria jako waga, nie filtr
         if use_geometry_validation:
-            # Hough jako waga pewnosci kierunku w regionie
             roi_v = v8[y:y + h0, x:x + w]
             edges = cv2.Canny(roi_v, 50, 150)
             edges = cv2.bitwise_and(edges, region_mask)
@@ -244,15 +227,86 @@ def detect_shadow_physics(
                 'line_weight': float(line_weight),
             })
 
-    dir_weight_map = None
-    if use_geometry_validation:
-        base_w = shadow_score.astype(np.float32) if shadow_score is not None else (out > 0).astype(np.float32)
-        dir_weight_map = base_w * np.clip(weight_map, 0.0, 1.0)
+    return out, dbg_regions, dbg_lines, weight_map
+
+
+def _build_dir_weight_map(use_geometry_validation, shadow_score, out, weight_map):
+    if not use_geometry_validation:
+        return None
+    base_w = shadow_score.astype(np.float32) if shadow_score is not None else (out > 0).astype(np.float32)
+    return base_w * np.clip(weight_map, 0.0, 1.0)
+
+
+def detect_shadow_physics(
+        image_bgr,
+        v_thresh=75,
+        hue_window=31,
+        hue_diff_max=10,
+        min_area=200,
+        min_elongation=1.3,
+        morph_kernel=5,
+        # wzmocnienie lokalnego kontrastu (luminancja)
+        use_clahe=True,
+        clahe_clip_limit=2.0,
+        clahe_tile_grid_size=(8, 8),
+        # progi ratio (wieloskalowe V/blur(V))
+        ratio_blur_sizes=(15, 31, 61),
+        ratio_thresholds=(0.75, 0.70, 0.65),
+        # miekka skala cienia (skala szarosci)
+        use_soft_shadow=True,
+        soft_shadow_thresh=0.20,
+        soft_shadow_scale=0.40,
+        # walidacja geometryczna (filtr binarny)
+        use_geometry_validation=True,
+        min_line_conf=0.35,
+        debug=False,
+):
+    """Detekcja cieni na podstawie luminancji i spojnosc koloru.
+
+    Zwraca maskę 0/255; gdy debug=True zwraca (mask, dbg_dict).
+    """
+    if image_bgr is None:
+        raise ValueError('Pusty obraz')
+
+    img = cv2.GaussianBlur(image_bgr, (5, 5), 0)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    if use_clahe:
+        v = _apply_clahe(v, clahe_clip_limit, clahe_tile_grid_size)
+
+    v8 = v
+
+    base_mask, v_mask, ratio_mask, ratio_maps, ratio_min, soft_mask, shadow_score = _compute_base_shadow_mask(
+        v8,
+        v_thresh,
+        ratio_blur_sizes,
+        ratio_thresholds,
+        use_soft_shadow,
+        soft_shadow_thresh,
+        soft_shadow_scale,
+    )
+
+    hue_ok = _compute_hue_mask(h, hue_window, hue_diff_max)
+    cand = cv2.bitwise_and(base_mask, hue_ok)
+    cand = _apply_morphology(cand, morph_kernel)
+
+    out, dbg_regions, dbg_lines, weight_map = _filter_components(
+        cand,
+        v8,
+        min_area,
+        min_elongation,
+        use_geometry_validation,
+        min_line_conf,
+        debug,
+    )
+
+    dir_weight_map = _build_dir_weight_map(use_geometry_validation, shadow_score, out, weight_map)
 
     if not debug:
         return out
 
-    # debug maps
+    # mapy diagnostyczne
     v_f = v8.astype(np.float32)
     gx = cv2.Sobel(v_f, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(v_f, cv2.CV_32F, 0, 1, ksize=3)

@@ -65,14 +65,14 @@ class ShadowTunerApp(tk.Tk, UiMixin, SourceDialogMixin, MediaPlayerMixin, Render
         self.VIEW_H = 650
         self.COMPASS_W = 180
 
-        self.var_v_thresh = tk.IntVar(value=75)
-        self.var_hue_diff = tk.IntVar(value=10)
+        self.var_v_thresh = tk.IntVar(value=120)
+        self.var_hue_diff = tk.IntVar(value=20)
         self.var_min_area = tk.IntVar(value=250)
-        self.var_min_elong_x100 = tk.IntVar(value=130)
+        self.var_min_elong_x100 = tk.IntVar(value=100)
         self.var_morph_kernel = tk.IntVar(value=5)
         self.var_soft_shadow = tk.BooleanVar(value=True)
-        self.var_soft_shadow_thresh_x100 = tk.IntVar(value=20)
-        self.var_soft_shadow_scale_x100 = tk.IntVar(value=40)
+        self.var_soft_shadow_thresh_x100 = tk.IntVar(value=30)
+        self.var_soft_shadow_scale_x100 = tk.IntVar(value=20)
         self.var_show_soft_mask = tk.BooleanVar(value=True)
 
         self.var_use_dir_hough = tk.BooleanVar(value=True)
@@ -80,8 +80,9 @@ class ShadowTunerApp(tk.Tk, UiMixin, SourceDialogMixin, MediaPlayerMixin, Render
         self.var_use_dir_grad = tk.BooleanVar(value=True)
 
         self.var_use_geom = tk.BooleanVar(value=True)
-        self.var_use_clahe = tk.BooleanVar(value=True)
+        self.var_use_clahe = tk.BooleanVar(value=False)
         self.var_overlay = tk.BooleanVar(value=True)
+
 
         self._build_ui()
         self._bind_events()
