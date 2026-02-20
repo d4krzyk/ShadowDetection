@@ -64,6 +64,11 @@ class RenderWorkerMixin:
 
             last_done = req_id
             params = self._read_params()
+            params_key = tuple(sorted(params.items()))
+            if getattr(self, "_mean_conf_params_key", None) != params_key:
+                self._mean_conf_params_key = params_key
+                self._mean_conf_count = 0
+                self._mean_conf_running = 0.0
 
             img = self.img_bgr
             if img is None:
@@ -86,7 +91,12 @@ class RenderWorkerMixin:
                     soft_shadow_scale=params["soft_shadow_scale"],
                     debug=True,
                 )
-                overlay_mask = dbg.get("shadow_score") if isinstance(dbg, dict) else None
+                if isinstance(dbg, dict):
+                    overlay_mask = dbg.get("dir_weight_map")
+                    if overlay_mask is None:
+                        overlay_mask = dbg.get("shadow_score")
+                else:
+                    overlay_mask = None
             else:
                 mask = detect_shadow_physics(
                     img,
@@ -107,41 +117,66 @@ class RenderWorkerMixin:
             use_soft = bool(params.get("show_soft_mask", True))
             display_mask = overlay_mask if (use_soft and overlay_mask is not None) else mask
 
-            vec, conf, ang = None, 0.0, 0.0
-            try:
-                use_h = bool(params.get("use_dir_hough", True))
-                use_p = bool(params.get("use_dir_pca", True))
-                use_g = bool(params.get("use_dir_grad", True))
-                if not (use_h or use_p or use_g):
-                    use_h = use_p = use_g = True
+            vec, conf, ang = None, None, None
+            mean_conf = None
+            mask_valid = mask is not None and int(np.count_nonzero(mask)) >= 50
+            if mask_valid:
+                try:
+                    use_h = bool(params.get("use_dir_hough", True))
+                    use_p = bool(params.get("use_dir_pca", True))
+                    use_g = bool(params.get("use_dir_grad", True))
+                    if not (use_h or use_p or use_g):
+                        use_h = use_p = use_g = True
 
-                components = []
+                    components = []
+                    conf_h = None
+                    vec_h = None
+                    vec_g = None
+                    v_m = None
 
-                if use_h:
-                    ang_h, vec_h, conf_h = estimate_light_direction_shadow_edges(img)
-                    components.append({"name": "hough", "vec": vec_h, "conf": float(conf_h)})
+                    if use_h:
+                        ang_h, vec_h, conf_h = estimate_light_direction_shadow_edges(img)
 
-                if use_g:
-                    ang_g, vec_g, conf_g = estimate_light_direction_shadow_edge_gradient(img, mask, weight_map=overlay_mask)
-                    components.append({"name": "grad_edge", "vec": vec_g, "conf": float(max(0.10, conf_g))})
+                    if use_g:
+                        ang_g, vec_g, conf_g = estimate_light_direction_shadow_edge_gradient(img, mask, weight_map=overlay_mask)
+                        components.append({"name": "grad_edge", "vec": vec_g, "conf": float(max(0.10, conf_g))})
 
-                if use_p:
-                    pca_out = estimate_from_mask_pca_tip(mask, weight_map=overlay_mask, debug=True)
-                    v_m, conf_m, _dbg_m = pca_out
-                    visible, conf_obj, _dbg_obj = is_object_visible_opposite_shadow(
-                        img,
-                        mask,
-                        _normalize2(-np.array(v_m, dtype=np.float32)),
-                        debug=True,
-                    )
-                    conf_m2 = float(np.clip(conf_m + 0.25 * conf_obj, 0.0, 1.0))
-                    components.append({"name": "mask", "vec": v_m, "conf": conf_m2})
+                    if use_p:
+                        pca_out = estimate_from_mask_pca_tip(mask, weight_map=overlay_mask, debug=True)
+                        v_m, conf_m, _dbg_m = pca_out
+                        visible, conf_obj, _dbg_obj = is_object_visible_opposite_shadow(
+                            img,
+                            mask,
+                            _normalize2(-np.array(v_m, dtype=np.float32)),
+                            debug=True,
+                        )
+                        conf_m2 = float(np.clip(conf_m + 0.25 * conf_obj, 0.0, 1.0))
+                        components.append({"name": "mask", "vec": v_m, "conf": conf_m2})
 
-                v_final, conf = merge_vectors(components)
-                ang = (np.degrees(np.arctan2(float(v_final[1]), float(v_final[0]))) + 360.0) % 360.0
-                vec = (float(v_final[0]), float(v_final[1]))
-            except Exception:
-                pass
+                    if use_h and vec_h is not None and conf_h is not None:
+                        if vec_g is not None and v_m is not None:
+                            vh = _normalize2(vec_h)
+                            vg = _normalize2(vec_g)
+                            vm = _normalize2(v_m)
+                            if float(np.dot(vm, vg)) > 0.0 and float(np.dot(vh, vm)) < 0.0 and float(np.dot(vh, vg)) < 0.0:
+                                conf_h = float(conf_h) * 0.35
+                        components.append({"name": "hough", "vec": vec_h, "conf": float(conf_h)})
+
+                    v_final, conf = merge_vectors(components)
+                    if conf is not None and float(conf) > 1e-6:
+                        ang = (np.degrees(np.arctan2(float(v_final[1]), float(v_final[0]))) + 360.0) % 360.0
+                        vec = (float(v_final[0]), float(v_final[1]))
+                        mean_conf = float(np.clip(float(conf), 0.0, 1.0))
+                        self._mean_conf_count = int(getattr(self, "_mean_conf_count", 0)) + 1
+                        prev = float(getattr(self, "_mean_conf_running", 0.0))
+                        self._mean_conf_running = prev + (mean_conf - prev) / float(self._mean_conf_count)
+                    else:
+                        vec, conf, ang = None, None, None
+                except Exception:
+                    vec, conf, ang = None, None, None
+                    mean_conf = None
+
+            mean_conf_display = float(getattr(self, "_mean_conf_running", 0.0)) if getattr(self, "_mean_conf_count", 0) > 0 else None
 
             view = build_main_view(
                 img,
@@ -149,8 +184,9 @@ class RenderWorkerMixin:
                 overlay=params["overlay"],
                 show_direction=True,
                 light_vec=vec,
-                light_ang=float(ang),
-                light_conf=float(conf),
+                light_ang=ang,
+                light_conf=conf,
+                mean_conf=mean_conf_display,
                 view_w=self.VIEW_W,
                 view_h=self.VIEW_H,
                 compass_w=self.COMPASS_W,

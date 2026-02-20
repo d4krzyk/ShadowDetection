@@ -187,6 +187,10 @@ def draw_light_vector(img_bgr, angle_deg, vec_xy=None, origin=None, length=None,
         origin = (int(0.12 * w), int(0.18 * h))
     ox, oy = int(origin[0]), int(origin[1])
 
+    if angle_deg is None and vec_xy is None:
+        draw_text_box(out, "Light dir: unknown", org=(ox, max(25, oy - 10)), font_scale=0.55, color=(255, 255, 255), bg_color=(0, 0, 0))
+        return out
+
     if length is None:
         length = int(0.18 * min(h, w))
 
@@ -419,7 +423,7 @@ def letterbox_to_canvas(img_bgr, canvas_w, canvas_h, bg=(10, 10, 10), inner_marg
     return canvas
 
 
-def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, w=170, h=300, title='LIGHT'):
+def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, mean_conf=None, w=170, h=300, title='LIGHT'):
     """Mały 'kompas' pokazujący kierunek światła strzałką."""
     w = int(max(96, w))
     h = int(max(96, h))
@@ -442,7 +446,8 @@ def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, w=170, h=300, t
     put('W', cx - r - 22, cy + 6)
     put('E', cx + r + 10, cy + 6)
 
-    if vec_xy is not None:
+    is_known = vec_xy is not None and angle_deg is not None and confidence is not None
+    if is_known:
         vx, vy = float(vec_xy[0]), float(vec_xy[1])
         n = (vx * vx + vy * vy) ** 0.5 + 1e-6
         vx /= n
@@ -453,10 +458,19 @@ def render_compass_widget(vec_xy, angle_deg=0.0, confidence=0.0, w=170, h=300, t
         ey = int(round(cy + vy * length))
         cv2.arrowedLine(canvas, (cx, cy), (ex, ey), (0, 255, 0), 2, tipLength=0.22)
 
-    conf = float(np.clip(float(confidence), 0.0, 1.0))
-    ang = float(angle_deg) % 360.0
-    cv2.putText(canvas, f"Angle {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
-    cv2.putText(canvas, f"Confidence {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+        conf = float(np.clip(float(confidence), 0.0, 1.0))
+        ang = float(angle_deg) % 360.0
+        cv2.putText(canvas, f"Angle {ang:.0f} deg", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"Confidence {conf:.2f}", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(canvas, "Angle unknown", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+        cv2.putText(canvas, "Confidence unknown", (10, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (240, 240, 240), 1, cv2.LINE_AA)
+
+    if mean_conf is not None:
+        mc = float(np.clip(float(mean_conf), 0.0, 1.0))
+        cv2.putText(canvas, f"Mean conf {mc:.2f}", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+    else:
+        cv2.putText(canvas, "Mean conf unknown", (10, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
 
     cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (60, 60, 60), 1)
     return canvas
@@ -470,6 +484,7 @@ def build_main_view(image_bgr,
                     light_vec,
                     light_ang,
                     light_conf,
+                    mean_conf,
                     view_w,
                     view_h,
                     compass_w,
@@ -490,6 +505,7 @@ def build_main_view(image_bgr,
     compass = render_compass_widget(light_vec if show_direction else None,
                                    angle_deg=light_ang if show_direction else 0.0,
                                    confidence=light_conf if show_direction else 0.0,
+                                   mean_conf=mean_conf if show_direction else None,
                                    w=compass_w,
                                    h=view_h)
     if not show_direction:

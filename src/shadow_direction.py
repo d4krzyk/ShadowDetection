@@ -37,6 +37,116 @@ def _normalize2(v):
     return v / n
 
 
+def _pca_tip_from_mask_component(mask_u8, weight_map=None, min_pixels=300, tip_quantile=0.92, debug=False):
+    if mask_u8 is None:
+        raise ValueError('Pusta maska')
+
+    m = mask_u8
+    if len(m.shape) == 3:
+        m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
+
+    if m.dtype != np.uint8:
+        mm = m.astype(np.float32)
+        if mm.max() <= 1.0:
+            mm = mm * 255.0
+        m = np.clip(mm, 0, 255).astype(np.uint8)
+
+    pts = np.column_stack(np.where(m > 0))
+    if pts.shape[0] < int(min_pixels):
+        v = np.array([1.0, 0.0], dtype=np.float32)
+        return (v, 0.0, {'reason': 'too_few_pixels', 'n': int(pts.shape[0])}) if debug else (v, 0.0)
+
+    xy = pts[:, ::-1].astype(np.float32)  # (x,y)
+
+    weights = None
+    if weight_map is not None:
+        if len(weight_map.shape) == 3:
+            wmap = cv2.cvtColor(weight_map, cv2.COLOR_BGR2GRAY)
+        else:
+            wmap = weight_map
+        w = wmap[pts[:, 0], pts[:, 1]].astype(np.float32)
+        if w.max() > 1.0:
+            w = w / 255.0
+        w = np.clip(w, 0.0, 1.0)
+        if float(np.sum(w)) > 1e-6:
+            weights = w
+
+    if weights is None:
+        mean = xy.mean(axis=0)
+        X = xy - mean
+        cov = (X.T @ X) / float(max(1, X.shape[0] - 1))
+    else:
+        wsum = float(np.sum(weights))
+        mean = (xy * weights[:, None]).sum(axis=0) / max(1e-6, wsum)
+        X = xy - mean
+        cov = (X.T * weights) @ X / max(1e-6, wsum)
+
+    evals, evecs = np.linalg.eigh(cov)  # evals asc
+    order = np.argsort(evals)[::-1]
+    evals = evals[order]
+    evecs = evecs[:, order]
+
+    main_axis = evecs[:, 0].astype(np.float32)
+    main_axis = main_axis / (np.linalg.norm(main_axis) + 1e-6)
+
+    proj = (X @ main_axis).astype(np.float32)
+
+    gray_mu = 0.0
+    gray_conf = 0.0
+    if weights is not None:
+        wsum = float(np.sum(weights))
+        gray_mu = float(np.sum(weights * proj) / max(1e-6, wsum))
+        p_std = float(np.std(proj) + 1e-6)
+        gray_conf = float(np.clip(abs(gray_mu) / (2.0 * p_std), 0.0, 1.0))
+        if gray_mu < 0.0:
+            main_axis = -main_axis
+            proj = -proj
+
+    # Tip selection: far end opposite to the weighted (darker) side
+    q_far = 1.0 - float(tip_quantile)
+    if weights is not None:
+        thr = float(np.quantile(proj, q_far))
+        tip_pts = xy[proj <= thr]
+    else:
+        thr = float(np.quantile(proj, float(tip_quantile)))
+        tip_pts = xy[proj >= thr]
+
+    if tip_pts.shape[0] < 10:
+        tip = xy[int(np.argmin(proj))] if weights is not None else xy[int(np.argmax(proj))]
+    else:
+        tip = tip_pts.mean(axis=0)
+
+    dir_vec = (mean - tip).astype(np.float32)
+    if float(np.linalg.norm(dir_vec)) < 1e-6:
+        dir_vec = -main_axis
+    dir_vec = _normalize2(dir_vec)
+
+    lam1 = float(max(evals[0], 1e-6))
+    lam2 = float(max(evals[1], 1e-6))
+    ratio = lam1 / lam2
+    elong_conf = float(np.clip((ratio - 1.2) / 4.0, 0.0, 1.0))
+    size_conf = float(np.clip((pts.shape[0] - min_pixels) / 5000.0, 0.0, 1.0))
+    conf = float(np.clip(0.15 + 0.55 * elong_conf + 0.2 * size_conf + 0.1 * gray_conf, 0.0, 1.0))
+
+    if not debug:
+        return dir_vec, conf
+
+    dbg = {
+        'centroid_xy': (float(mean[0]), float(mean[1])),
+        'tip_xy': (float(tip[0]), float(tip[1])),
+        'axis_vec': (float(main_axis[0]), float(main_axis[1])),
+        'dir_vec': (float(dir_vec[0]), float(dir_vec[1])),
+        'eigs': (float(lam1), float(lam2)),
+        'eig_ratio': float(ratio),
+        'n_pixels': int(pts.shape[0]),
+        'elong_conf': float(elong_conf),
+        'size_conf': float(size_conf),
+        'gray_mu': float(gray_mu),
+        'gray_conf': float(gray_conf),
+    }
+    return dir_vec, conf, dbg
+
+
 def merge_vectors(components):
     """Laczy wektory kierunku z wagami confidence.
 
@@ -359,102 +469,61 @@ def estimate_from_mask_pca_tip(shadow_mask, weight_map=None, min_pixels=300, tip
             mm = mm * 255.0
         m = np.clip(mm, 0, 255).astype(np.uint8)
 
-    m = _largest_connected_component(m)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((m > 0).astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return _pca_tip_from_mask_component(m, weight_map=weight_map, min_pixels=min_pixels, tip_quantile=tip_quantile, debug=debug)
 
-    pts = np.column_stack(np.where(m > 0))
-    if pts.shape[0] < int(min_pixels):
-        v = np.array([1.0, 0.0], dtype=np.float32)
-        return (v, 0.0, {'reason': 'too_few_pixels', 'n': int(pts.shape[0])}) if debug else (v, 0.0)
+    best = None
+    best_score = -1.0
+    debug_components = []
+    total_area = float(np.sum(stats[1:, cv2.CC_STAT_AREA])) + 1e-6
 
-    xy = pts[:, ::-1].astype(np.float32)  # (x,y)
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        comp_mask = (labels == i).astype(np.uint8) * 255
+        out = _pca_tip_from_mask_component(
+            comp_mask,
+            weight_map=weight_map,
+            min_pixels=min_pixels,
+            tip_quantile=tip_quantile,
+            debug=debug,
+        )
 
-    weights = None
-    if weight_map is not None:
-        if len(weight_map.shape) == 3:
-            wmap = cv2.cvtColor(weight_map, cv2.COLOR_BGR2GRAY)
+        if debug:
+            v_c, conf_c, dbg_c = out
         else:
-            wmap = weight_map
-        w = wmap[pts[:, 0], pts[:, 1]].astype(np.float32)
-        if w.max() > 1.0:
-            w = w / 255.0
-        w = np.clip(w, 0.0, 1.0)
-        if float(np.sum(w)) > 1e-6:
-            weights = w
+            v_c, conf_c = out
+            dbg_c = None
 
-    if weights is None:
-        mean = xy.mean(axis=0)
-        X = xy - mean
-        cov = (X.T @ X) / float(max(1, X.shape[0] - 1))
-    else:
-        wsum = float(np.sum(weights))
-        mean = (xy * weights[:, None]).sum(axis=0) / max(1e-6, wsum)
-        X = xy - mean
-        cov = (X.T * weights) @ X / max(1e-6, wsum)
+        area_weight = float(area) / total_area
+        score = float(conf_c) * area_weight
+        if score > best_score:
+            best_score = score
+            best = (v_c, float(conf_c), dbg_c, area)
 
-    evals, evecs = np.linalg.eigh(cov)  # evals asc
-    order = np.argsort(evals)[::-1]
-    evals = evals[order]
-    evecs = evecs[:, order]
+        if debug:
+            debug_components.append({
+                'area': int(area),
+                'conf': float(conf_c),
+                'score': float(score),
+                'dbg': dbg_c,
+            })
 
-    main_axis = evecs[:, 0].astype(np.float32)
-    main_axis = main_axis / (np.linalg.norm(main_axis) + 1e-6)
+    if best is None:
+        v = np.array([1.0, 0.0], dtype=np.float32)
+        return (v, 0.0, {'reason': 'no_valid_components'}) if debug else (v, 0.0)
 
-    proj = (X @ main_axis).astype(np.float32)
-
-    gray_mu = 0.0
-    gray_conf = 0.0
-    if weights is not None:
-        wsum = float(np.sum(weights))
-        gray_mu = float(np.sum(weights * proj) / max(1e-6, wsum))
-        p_std = float(np.std(proj) + 1e-6)
-        gray_conf = float(np.clip(abs(gray_mu) / (2.0 * p_std), 0.0, 1.0))
-        if gray_mu < 0.0:
-            main_axis = -main_axis
-            proj = -proj
-
-    # Tip selection: far end opposite to the weighted (darker) side
-    q_far = 1.0 - float(tip_quantile)
-    if weights is not None:
-        thr = float(np.quantile(proj, q_far))
-        tip_pts = xy[proj <= thr]
-    else:
-        thr = float(np.quantile(proj, float(tip_quantile)))
-        tip_pts = xy[proj >= thr]
-
-    if tip_pts.shape[0] < 10:
-        tip = xy[int(np.argmin(proj))] if weights is not None else xy[int(np.argmax(proj))]
-    else:
-        tip = tip_pts.mean(axis=0)
-
-    dir_vec = (mean - tip).astype(np.float32)
-    if float(np.linalg.norm(dir_vec)) < 1e-6:
-        dir_vec = -main_axis
-    dir_vec = _normalize2(dir_vec)
-
-    lam1 = float(max(evals[0], 1e-6))
-    lam2 = float(max(evals[1], 1e-6))
-    ratio = lam1 / lam2
-    elong_conf = float(np.clip((ratio - 1.2) / 4.0, 0.0, 1.0))
-    size_conf = float(np.clip((pts.shape[0] - min_pixels) / 5000.0, 0.0, 1.0))
-    conf = float(np.clip(0.15 + 0.55 * elong_conf + 0.2 * size_conf + 0.1 * gray_conf, 0.0, 1.0))
-
+    v_best, conf_best, dbg_best, area_best = best
     if not debug:
-        return dir_vec, conf
+        return v_best, float(conf_best)
 
     dbg = {
-        'centroid_xy': (float(mean[0]), float(mean[1])),
-        'tip_xy': (float(tip[0]), float(tip[1])),
-        'axis_vec': (float(main_axis[0]), float(main_axis[1])),
-        'dir_vec': (float(dir_vec[0]), float(dir_vec[1])),
-        'eigs': (float(lam1), float(lam2)),
-        'eig_ratio': float(ratio),
-        'n_pixels': int(pts.shape[0]),
-        'elong_conf': float(elong_conf),
-        'size_conf': float(size_conf),
-        'gray_mu': float(gray_mu),
-        'gray_conf': float(gray_conf),
+        'selected_area': int(area_best),
+        'selected_conf': float(conf_best),
+        'components': debug_components,
+        'selected_dbg': dbg_best,
     }
-    return dir_vec, conf, dbg
+    return v_best, float(conf_best), dbg
 
 
 def is_object_visible_opposite_shadow(image_bgr, shadow_mask, shadow_dir_xy, sample_len=45, band_half=8, dark_drop=18, debug=False):
@@ -598,4 +667,3 @@ def fuse_light_vectors(image_bgr, shadow_mask, shadow_score=None, prefer_mask=Tr
         'weights': {'w_h': w_h, 'w_m': w_m, 'w_g': w_g},
     }
     return float(angle_deg), (float(v_final[0]), float(v_final[1])), float(conf), dbg
-

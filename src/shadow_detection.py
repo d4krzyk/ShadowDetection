@@ -197,7 +197,7 @@ def detect_shadow_physics(
         region_mask = (labels[y:y + h0, x:x + w] == i).astype(np.uint8) * 255
         line_angle = None
         line_conf = 0.0
-        line_weight = 0.0
+        line_weight = 1.0
 
         # 7) geometria jako waga, nie filtr
         if use_geometry_validation:
@@ -226,10 +226,10 @@ def detect_shadow_physics(
                     hough_thresh=40,
                 )
 
-        if float(min_line_conf) > 1e-6:
-            line_weight = float(np.clip(float(line_conf) / float(min_line_conf), 0.0, 1.0))
-        else:
-            line_weight = float(np.clip(float(line_conf), 0.0, 1.0))
+            if float(min_line_conf) > 1e-6:
+                line_weight = float(np.clip(float(line_conf) / float(min_line_conf), 0.0, 1.0))
+            else:
+                line_weight = float(np.clip(float(line_conf), 0.0, 1.0))
 
         out[y:y + h0, x:x + w] = cv2.bitwise_or(out[y:y + h0, x:x + w], region_mask)
         weight_map[y:y + h0, x:x + w] = np.maximum(weight_map[y:y + h0, x:x + w], float(line_weight))
@@ -243,6 +243,11 @@ def detect_shadow_physics(
                 'line_conf': float(line_conf),
                 'line_weight': float(line_weight),
             })
+
+    dir_weight_map = None
+    if use_geometry_validation:
+        base_w = shadow_score.astype(np.float32) if shadow_score is not None else (out > 0).astype(np.float32)
+        dir_weight_map = base_w * np.clip(weight_map, 0.0, 1.0)
 
     if not debug:
         return out
@@ -277,6 +282,7 @@ def detect_shadow_physics(
         'regions': dbg_regions,
         'lines': dbg_lines,
         'weight_map': weight_map,
+        'dir_weight_map': dir_weight_map,
     }
     return out, dbg
 
