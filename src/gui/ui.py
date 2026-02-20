@@ -77,10 +77,10 @@ class UiMixin:
         r = self._add_scale(
             params_frame,
             r,
-            "soft_scale*100 (10-80)",
+            "soft_scale*100 (10-200)",
             self.var_soft_shadow_scale_x100,
             10,
-            80,
+            200,
             desc="Wyżej: mniej agresywne uznawanie ciemnosci za cien.",
         )
 

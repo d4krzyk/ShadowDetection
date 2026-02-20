@@ -216,7 +216,15 @@ def estimate_light_direction_shadow_edges(image_bgr,
     return float(angle_deg), vec_xy, confidence
 
 
-def estimate_light_direction_shadow_edge_gradient(image_bgr, shadow_mask, weight_map=None, edge_ring=2, debug=False):
+def estimate_light_direction_shadow_edge_gradient(
+        image_bgr,
+        shadow_mask,
+        weight_map=None,
+        edge_ring=2,
+        mag_percentile=75,
+        hp_blur_ksize=51,
+        debug=False,
+):
     """Kierunek z gradientu luminancji liczony tylko na krawędzi cienia.
 
     To zwykle stabilniejsze niż globalny gradient, bo ograniczamy się do miejsca,
@@ -241,12 +249,14 @@ def estimate_light_direction_shadow_edge_gradient(image_bgr, shadow_mask, weight
         out = (0.0, (1.0, 0.0), 0.0)
         return (*out, {'reason': 'too_few_mask_pixels'}) if debug else out
 
-    # bardzo cienki pierścień na granicy maski
+    # Inner-ring: wąski pas *wewnątrz* cienia (zmniejsza wpływ tekstury jasnej strony).
     k = int(max(1, edge_ring))
-    k = min(k, 7)
+    k = min(k, 9)
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
-    edge = cv2.morphologyEx((m > 0).astype(np.uint8) * 255, cv2.MORPH_GRADIENT, ker)
-    edge = (edge > 0)
+    m_bin = (m > 0).astype(np.uint8) * 255
+    inner = cv2.erode(m_bin, ker, iterations=1)
+    ring = cv2.subtract(m_bin, inner)
+    edge = (ring > 0)
 
     if int(np.count_nonzero(edge)) < 30:
         out = (0.0, (1.0, 0.0), 0.0)
@@ -255,13 +265,28 @@ def estimate_light_direction_shadow_edge_gradient(image_bgr, shadow_mask, weight
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
     v = hsv[:, :, 2].astype(np.float32)
 
-    gx = cv2.Sobel(v, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(v, cv2.CV_32F, 0, 1, ksize=3)
+    # Tłumienie tekstury: high-pass na V (V - blur(V)).
+    kk = int(max(3, hp_blur_ksize))
+    if kk % 2 == 0:
+        kk += 1
+    kk = min(kk, 151)
+    v_blur = cv2.GaussianBlur(v, (kk, kk), 0)
+    v_hp = v - v_blur
+
+    gx = cv2.Sobel(v_hp, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(v_hp, cv2.CV_32F, 0, 1, ksize=3)
 
     ys, xs = np.where(edge)
     gxs = gx[ys, xs]
     gys = gy[ys, xs]
     mag = np.sqrt(gxs * gxs + gys * gys) + 1e-6
+
+    # Odrzucenie slabego gradientu (najczesciej faktura / szum).
+    mp = float(np.clip(float(mag_percentile), 0.0, 99.0))
+    thr = float(np.percentile(mag, mp))
+    keep = mag >= max(1e-6, thr)
+    if int(np.count_nonzero(keep)) < 20:
+        keep = mag >= max(1e-6, float(np.percentile(mag, 60.0)))
 
     # wagi: siła gradientu * opcjonalna waga z mapy (np. shadow_score 0..1)
     w = mag.copy()
@@ -276,8 +301,10 @@ def estimate_light_direction_shadow_edge_gradient(image_bgr, shadow_mask, weight
             wm = wm / 255.0
         w = w * np.clip(wm[ys, xs], 0.0, 1.0)
 
-    vx = gxs / mag
-    vy = gys / mag
+    # zastosuj keep
+    w = w[keep]
+    vx = (gxs / mag)[keep]
+    vy = (gys / mag)[keep]
 
     sx = float(np.sum(vx * w))
     sy = float(np.sum(vy * w))
@@ -289,15 +316,24 @@ def estimate_light_direction_shadow_edge_gradient(image_bgr, shadow_mask, weight
 
     v_out = (sx / norm, sy / norm)
 
+    ang = (np.degrees(np.arctan2(v_out[1], v_out[0])) + 360.0) % 360.0
+
     # confidence = spójność kierunków na krawędzi
     conf = float(np.clip(norm / (float(np.sum(w)) + 1e-6), 0.0, 1.0))
-    ang = (np.degrees(np.arctan2(v_out[1], v_out[0])) + 360.0) % 360.0
+    # penalizuj, gdy zostalo malo punktow (mniej wiarygodne)
+    size_boost = float(np.clip((float(vx.size) - 50.0) / 500.0, 0.0, 1.0))
+    conf = float(np.clip(0.15 + 0.85 * conf, 0.0, 1.0))
+    conf = float(np.clip(conf * (0.6 + 0.4 * size_boost), 0.0, 1.0))
 
     if not debug:
         return float(ang), (float(v_out[0]), float(v_out[1])), float(conf)
 
     dbg = {
-        'edge_pixels': int(xs.size),
+        'ring_pixels': int(np.count_nonzero(edge)),
+        'kept_pixels': int(vx.size),
+        'mag_percentile': float(mp),
+        'mag_thr': float(thr),
+        'hp_blur_ksize': int(kk),
         'sum_w': float(np.sum(w)),
         'norm': float(norm),
     }
